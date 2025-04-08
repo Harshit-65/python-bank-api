@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from .middleware.logging import LoggingMiddleware
 from .auth.dependencies import AuthData # Example import
 from .api.routers import health, upload, jobs # <-- Import new routers
+from .db.supabase_client import get_supabase_client
 
 # Create FastAPI app instance
 app = FastAPI(
@@ -19,7 +20,8 @@ app = FastAPI(
 
 # Add Middleware
 # LoggingMiddleware should typically be one of the first middleware added
-app.add_middleware(LoggingMiddleware)
+supabase = get_supabase_client()
+app.add_middleware(LoggingMiddleware, supabase=supabase)
 
 # --- Add Routers ---
 # It's often good practice to prefix API routes with /api/v1 or similar

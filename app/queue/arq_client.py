@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 from arq import create_pool
 from arq.connections import RedisSettings
 
@@ -22,7 +22,7 @@ async def get_arq_redis():
     redis = await create_pool(arq_redis_settings)
     return redis
 
-async def enqueue_job(ctx: Any, function_name: str, *args: Any, **kwargs: Any):
+async def enqueue_job(ctx: Any, function_name: str, job_params: Dict[str, Any]):
     """Enqueues a job using the ARQ client from the context."""
     try:
         redis = ctx.get("arq_redis")
@@ -33,11 +33,11 @@ async def enqueue_job(ctx: Any, function_name: str, *args: Any, **kwargs: Any):
             redis = await create_pool(arq_redis_settings)
             if not redis:
                 raise ConnectionError("Failed to connect to ARQ Redis")
-            await redis.enqueue_job(function_name, *args, **kwargs)
+            await redis.enqueue_job(function_name, **job_params)
             await redis.close()
         else:
-            await redis.enqueue_job(function_name, *args, **kwargs)
-        logger.info(f"Enqueued job '{function_name}' with args: {args}, kwargs: {kwargs}")
+            await redis.enqueue_job(function_name, **job_params)
+        logger.info(f"Enqueued job '{function_name}' with params: {job_params}")
     except Exception as e:
         logger.error(f"Error enqueuing job '{function_name}': {e}")
         # Decide how to handle enqueue errors (e.g., raise exception, retry)

@@ -30,7 +30,7 @@ class BatchFileModel(BaseModel):
 
 class BatchRequestModel(BaseModel):
     files: List[BatchFileModel] = Field(..., max_length=MAX_FILES, description="List of files to process in batch")
-    callback_url: Optional[AnyHttpUrl] = Field(None, description="Optional callback URL for batch completion notification")
+    callback_url: Optional[str] = Field(None, description="Optional callback URL for batch completion notification")
 
     @field_validator('files')
     @classmethod
@@ -41,7 +41,8 @@ class BatchRequestModel(BaseModel):
 
 class ParseRequestModel(BaseModel):
     file_id: str = Field(..., min_length=1)
-    callback_url: Optional[AnyHttpUrl] = None
+    document_id: str = Field(..., min_length=1)
+    callback_url: Optional[str] = None
 
 # --- Models for Query Parameters (used in List requests) ---
 

@@ -1,5 +1,7 @@
 import time
 import datetime
+
+from fastapi import HTTPException
 from typing import Optional
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -12,120 +14,124 @@ from ..db.supabase_client import get_supabase_client
 
 async def log_api_usage_to_supabase(
     supabase: Client,
-    user_id: Optional[str],
-    api_key_id: Optional[str],
+    user_id: str,
+    api_key_id: str,
     endpoint: str,
     method: str,
     status_code: int,
-    response_time_ms: int,
-    request_size: Optional[int],
-    response_size: Optional[int],
-    ip_address: Optional[str],
-    user_agent: Optional[str],
-):
-    """Asynchronously logs API usage data to the Supabase 'api_logs' table."""
-    # Skip logging if essential IDs from authenticated requests are missing
-    # Allow logging for potentially unauthenticated routes or errors before auth
-    # if user_id is None or api_key_id is None:
-    #     print("Skipping log: Missing user_id or api_key_id (request might be unauthenticated or failed early)")
-    #     return
-
-    log_entry = {
-        "user_id": user_id, # May be None
-        "api_key_id": api_key_id, # May be None
-        "endpoint": endpoint,
-        "method": method,
-        "status_code": status_code,
-        "response_time": response_time_ms, # Changed name to match Go
-        "request_size": request_size, # May be None
-        "response_size": response_size, # May be None
-        "ip_address": ip_address,
-        "user_agent": user_agent,
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-
+    response_time: float,
+    request_size: Optional[int] = None,
+    response_size: Optional[int] = None,
+    ip_address: Optional[str] = None,
+    user_agent: Optional[str] = None
+) -> None:
+    """
+    Log API usage to Supabase.
+    
+    Args:
+        supabase: Supabase client
+        user_id: User ID
+        api_key_id: API key ID
+        endpoint: API endpoint
+        method: HTTP method
+        status_code: HTTP status code
+        response_time: Response time in milliseconds
+        request_size: Request size in bytes (optional)
+        response_size: Response size in bytes (optional)
+        ip_address: IP address (optional)
+        user_agent: User agent (optional)
+    """
     try:
-        # Use await for async Supabase client - REMOVE await for sync client v1
-        supabase.table("api_logs").insert(log_entry).execute()
-        # print(f"Successfully logged API usage for {endpoint}")
+        # Skip logging if user_id or api_key_id is null
+        if user_id is None or api_key_id is None:
+            print("Skipping log: Missing user_id or api_key_id")
+            return
+
+        # Prepare log data
+        log_data = {
+            "user_id": user_id,
+            "api_key_id": api_key_id,
+            "endpoint": endpoint,
+            "method": method,
+            "status_code": status_code,
+            "response_time": int(response_time),
+            "request_size": request_size,
+            "response_size": response_size,
+            "ip_address": ip_address,
+            "user_agent": user_agent,
+            "created_at": datetime.datetime.now().isoformat()
+        }
+
+        # Insert log into Supabase
+        result = supabase.table("api_logs").insert(log_data).execute()
+        
+        if hasattr(result, "error") and result.error:
+            print(f"Error logging API usage: {result.error}")
     except Exception as e:
-        # Log Supabase errors but don't fail the original request
-        print(f"Error logging API usage to Supabase: {e}")
+        print(f"Error logging API usage: {str(e)}")
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: ASGIApp):
+    def __init__(self, app: ASGIApp, supabase: Client):
         super().__init__(app)
-        # Get Supabase client during middleware initialization
-        # Note: For production, consider dependency injection if client setup becomes complex
-        self.supabase_client = get_supabase_client()
+        self.supabase = supabase
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+    async def dispatch(self, request: Request, call_next):
+        # Start timer
         start_time = time.time()
-
+        
         # Get request details
         method = request.method
         endpoint = request.url.path
         ip_address = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
-        request_size_str = request.headers.get("content-length")
-        request_size = int(request_size_str) if request_size_str and request_size_str.isdigit() else None
-
-        response = None # Initialize response
-        try:
-            # Process the request and get the response
-            response = await call_next(request)
-            status_code = response.status_code
-        except Exception as e:
-            # If an exception occurs during request processing (like a 422)
-            # log it and re-raise to let FastAPI handle the error response.
-            status_code = 500 # Default or determine from exception if possible
-            if isinstance(e, HTTPException):
-                 status_code = e.status_code
-            
-            # Calculate processing time even on error
-            process_time = time.time() - start_time
-            response_time_ms = int(process_time * 1000)
-            
-            # Log the error before raising
-            await self.log_request(
-                request=request,
-                status_code=status_code,
-                response_time_ms=response_time_ms,
-                request_size=request_size,
-                response_size=None, # No response size on exception
-                ip_address=ip_address,
-                user_agent=user_agent
-            )
-            raise e # Re-raise the exception
-        finally:
-            # Calculate processing time
-            process_time = time.time() - start_time
-            response_time_ms = int(process_time * 1000)
-
-            # Get response details if response exists
-            response_size = None
-            if response:
-                response_size_str = response.headers.get("content-length")
-                response_size = int(response_size_str) if response_size_str and response_size_str.isdigit() else None
-
-            # Log asynchronously (even if exception occurred, status_code is set)
-            await self.log_request(
-                request=request,
-                status_code=status_code,
-                response_time_ms=response_time_ms,
-                request_size=request_size,
-                response_size=response_size,
-                ip_address=ip_address,
-                user_agent=user_agent
-            )
-
+        
+        # Get request size if available
+        request_size = None
+        if hasattr(request, "_body"):
+            request_size = len(request._body)
+        
+        # Process request
+        response = await call_next(request)
+        
+        # Calculate response time
+        response_time = int((time.time() - start_time) * 1000)  # Convert to milliseconds
+        
+        # Get response size if available
+        response_size = None
+        if hasattr(response, "body"):
+            response_size = len(response.body)
+        
+        # Get user_id and api_key_id from request state if available
+        user_id = getattr(request.state, "user_id", None)
+        api_key_id = getattr(request.state, "api_key_id", None)
+        
+        # Skip logging if user_id or api_key_id is null
+        if user_id is None or api_key_id is None:
+            print(f"Skipping log for {method} {endpoint}: Missing user_id or api_key_id")
+            return response
+        
+        # Log API usage
+        await log_api_usage_to_supabase(
+            supabase=self.supabase,
+            user_id=user_id,
+            api_key_id=api_key_id,
+            endpoint=endpoint,
+            method=method,
+            status_code=response.status_code,
+            response_time=response_time,
+            request_size=request_size,
+            response_size=response_size,
+            ip_address=ip_address,
+            user_agent=user_agent
+        )
+        
         return response
     
     async def log_request(
         self,
         request: Request,
         status_code: int,
-        response_time_ms: int,
+        response_time: int,
         request_size: Optional[int],
         response_size: Optional[int],
         ip_address: Optional[str],
@@ -137,13 +143,13 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         api_key_id = getattr(request.state, "api_key_id", None)
 
         await log_api_usage_to_supabase(
-            supabase=self.supabase_client,
+            supabase=self.supabase,
             user_id=user_id,
             api_key_id=api_key_id,
             endpoint=request.url.path,
             method=request.method,
             status_code=status_code,
-            response_time_ms=response_time_ms,
+            response_time=response_time,
             request_size=request_size,
             response_size=response_size,
             ip_address=ip_address,

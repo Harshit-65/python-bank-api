@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 import mimetypes
 import json
@@ -101,13 +102,18 @@ async def upload_file_to_storage(
     user_id: str,
     doc_id: str, # Use document ID from DB as part of path
     doc_type: str = "invoice" # Add document type parameter with default
-) -> str:
-    """Uploads a file to Supabase storage."""
+) -> tuple[str, str]:
+    """Uploads a file to Supabase storage and returns (storage_path, public_url)."""
     content = await file.read()
     await file.seek(0) # Reset pointer in case it's needed again
     file_ext = os.path.splitext(file.filename)[1].lower()
-    # Use doc_id to ensure unique path even if filename is reused
-    storage_path = f"{user_id}/{doc_id}{file_ext}"
+    
+    # Generate a unique filename using timestamp (similar to Go implementation)
+    timestamp = int(time.time() * 1e9)
+    unique_filename = f"{timestamp}_{file.filename}"
+    
+    # Use unique_filename for storage path
+    storage_path = f"{user_id}/{unique_filename}"
     content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or 'application/octet-stream'
 
     # Map file type to bucket (similar to Go code)
@@ -125,16 +131,21 @@ async def upload_file_to_storage(
             file_options={"content-type": content_type, "upsert": "true"} # upsert=true replaces if exists
         )
         print(f"[Upload] Successfully uploaded to storage path: {storage_path} in bucket: {bucket}") # DEBUG
-        # Construct the public URL (adjust bucket name if different)
-        # Public URLs might require specific bucket policies in Supabase
-        # url_response = storage.from_(bucket).get_public_url(storage_path)
-        # For simplicity, returning path, URL construction can be complex
-        return storage_path
+        
+        # Construct the public URL using Supabase URL from environment
+        supabase_url = os.getenv("SUPABASE_URL")
+        if not supabase_url:
+            raise ValueError("SUPABASE_URL environment variable not set")
+            
+        public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{storage_path}"
+        
+        # Return both the storage path and the public URL
+        return unique_filename, public_url
     except Exception as e:
-        print(f"[Upload] Error uploading {file.filename} to storage: {e}") # DEBUG
+        print(f"[Upload] Error uploading file: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to upload file {file.filename} to storage."
+            detail={"code": "UPLOAD_ERROR", "message": "Failed to upload file", "details": str(e)}
         )
 
 # --- Document Classification ---
@@ -229,6 +240,7 @@ async def handle_upload(
     files: Annotated[List[UploadFile], File(description=f"Files to upload (max {MAX_FILES}, types: {', '.join(ALLOWED_EXTENSIONS)})")] = [],
     doc_type: Annotated[Optional[str], Form()] = None,  # Fixed: Use = for default value
 ):
+    """Handle file uploads for processing."""
     print(f"[Upload] Starting handle_upload with {len(files)} files, doc_type: {doc_type}")
     # --- Manual Authentication Step ---
     if token is None:
@@ -352,8 +364,8 @@ async def handle_upload(
                 raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
 
             # 3. Upload to Supabase Storage
-            storage_path = await upload_file_to_storage(storage, file, user_id, doc_id, determined_doc_type)
-            print(f"[Upload] File uploaded to storage path: {storage_path}")
+            unique_filename, file_url = await upload_file_to_storage(storage, file, user_id, doc_id, determined_doc_type)
+            print(f"[Upload] File uploaded to storage path: {unique_filename} with URL: {file_url}")
 
             # Optionally update DB record with storage_path if needed
             # supabase.table("documents").update({"storage_path": storage_path}).eq("id", doc_id).execute()
@@ -391,14 +403,14 @@ async def handle_upload(
 
         uploaded_files_data.append(
              UploadedFileModel(
-                 file_id=file.filename, # Use original filename as file_id for response
+                 file_id=unique_filename, # Use the unique filename as file_id for response
                  doc_id=doc_id, # Include the generated document ID
-                 file_url=file_url, # URL if generated
+                 file_url=file_url, # Now includes the public URL
                  error=upload_error,
                  type=determined_doc_type # Include the determined type
              )
          )
-        print(f"[Upload] Added file to response data: {file.filename}, doc_id: {doc_id}, type: {determined_doc_type}")
+        print(f"[Upload] Added file to response data: {file.filename}, doc_id: {doc_id}, type: {determined_doc_type}, url: {file_url}")
 
     # Return standardized success response
     response_data = UploadResponseModel(files=uploaded_files_data, status=overall_status)

@@ -9,7 +9,7 @@ from .requests import JobStatus # Import JobStatus enum
 
 class UploadedFileModel(BaseModel):
     file_id: str
-    file_url: Optional[AnyHttpUrl] = None # Optional as per Go model
+    file_url: Optional[str] = None # Changed from AnyHttpUrl to str to fix JSON serialization
     doc_id: Optional[str] = None
     error: Optional[str] = None
     type: Optional[str] = None
@@ -20,14 +20,13 @@ class UploadResponseModel(BaseModel):
 
 class JobCreatedResponseModel(BaseModel):
     job_id: str
-    status: JobStatus = JobStatus.PENDING # Default status on creation
+    status: JobStatus
 
 class JobStatusResponseModel(BaseModel):
-    job_id: str # Include job_id for clarity
+    job_id: str
     status: JobStatus
-    # Results can be any JSON structure, hence Any
-    # Consider defining specific result models later if structure is known
-    results: Optional[Any] = None 
+    error_message: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
     # Add other relevant fields if available from DB, e.g., file_id
