@@ -5,6 +5,7 @@ supabase: Client | None = None
 
 def get_supabase_client() -> Client:
     """Initializes and returns the Supabase client."""
+    print("Executing in: supabase_client.py - get_supabase_client")
     global supabase
     if supabase is None:
         if not SUPABASE_URL or not SUPABASE_KEY:

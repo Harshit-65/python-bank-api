@@ -5,14 +5,15 @@ import random
 from io import BytesIO
 from typing import Dict, Any, Optional
 import mimetypes
-from datetime import datetime
+from datetime import datetime, timezone
 
 import google.generativeai as genai
 from supabase import create_client, Client
 from PIL import Image
 import fitz # PyMuPDF
+import redis # Import the redis library
 
-from ..config import SUPABASE_URL, SUPABASE_KEY, GOOGLE_API_KEY, GOOGLE_API_KEYS
+from ..config import SUPABASE_URL, SUPABASE_KEY, GOOGLE_API_KEY, GOOGLE_API_KEYS, REDIS_URL, REDIS_PASSWORD
 from ..db.supabase_client import get_supabase_client # Re-use client logic
 from ..api.models.requests import JobStatus
 
@@ -70,19 +71,68 @@ def get_sync_supabase_client() -> Client:
         raise ValueError("Supabase URL/Key missing for worker")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
+def get_sync_redis_client() -> redis.Redis:
+    """Creates a synchronous Redis client for worker tasks."""
+    # Assuming REDIS_URL format like redis://[:password@]host:port[/db]
+    # decode_responses=True ensures keys/values are strings
+    return redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
+
+# Renamed function to clarify target
+async def update_job_status_in_redis(redis_client: redis.Redis, job_id: str, status: JobStatus, results: Optional[Dict[str, Any]] = None, error_message: Optional[str] = None):
+    """Updates job status and optionally results/error in Redis."""
+    redis_key = f"job:{job_id}"
+    try:
+        # Fetch existing job data
+        job_json = redis_client.get(redis_key)
+        if not job_json:
+            # If the job doesn't exist when trying to update, log an error.
+            # This might happen if the initial set failed or the key expired.
+            logger.error(f"Job {job_id}: Cannot update status in Redis. Job key '{redis_key}' not found.")
+            return
+        
+        try:
+            job_data = json.loads(job_json)
+        except json.JSONDecodeError:
+            logger.error(f"Job {job_id}: Failed to decode existing job JSON from Redis: {job_json}")
+            # Can't update if we can't parse, maybe set a simple error status?
+            # For now, just returning.
+            return
+
+        # Update fields
+        job_data["status"] = status.value
+        job_data["updated_at"] = datetime.now(timezone.utc).isoformat() # Update timestamp
+        if results is not None:
+            job_data["result"] = results # Store results directly (no need to dump again)
+        if error_message:
+            job_data["error_message"] = error_message # Add error if needed
+        else:
+            # Clear error message if status is not failed
+            job_data.pop("error_message", None) 
+
+        # Store updated job back in Redis (with expiration, matching Go code: 24 hours)
+        redis_client.set(redis_key, json.dumps(job_data), ex=24 * 3600)
+        logger.info(f"Updated job {job_id} status to {status.value} in Redis")
+
+    except Exception as e:
+        # Catch-all for other potential Redis errors (connection issues, etc.)
+        logger.error(f"Failed to update job {job_id} status in Redis: {e}")
+
+
+# --- Supabase update function (keep for now, might be needed elsewhere or if pattern changes) ---
+# This function is NO LONGER USED by process_document for status updates.
 async def update_job_status(supabase: Client, job_id: str, status: JobStatus, results: Optional[Dict[str, Any]] = None, error_message: Optional[str] = None):
     """Updates job status and optionally results/error in Supabase."""
-    update_data = {"status": status.value, "updated_at": datetime.now().isoformat()}
+    update_data = {"status": status.value, "updated_at": datetime.now(timezone.utc).isoformat()}
     if results is not None:
         update_data["results"] = json.dumps(results) # Store results as JSON string
     if error_message:
-        # Add an error field to your jobs table schema if needed
         update_data["error_message"] = error_message 
     try:
+        # *** IMPORTANT: This assumes a table named "jobs" exists ***
         await supabase.table("jobs").update(update_data).eq("id", job_id).execute()
-        logger.info(f"Updated job {job_id} status to {status.value}")
+        logger.warning(f"[DEPRECATED CALL] Updated job {job_id} status to {status.value} in Supabase table 'jobs'. Should use Redis.")
     except Exception as e:
-        logger.error(f"Failed to update job {job_id} status: {e}")
+        logger.error(f"Failed to update job {job_id} status in Supabase table 'jobs': {e}")
 
 def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     """Extracts a JSON object from a string, handling markdown code blocks."""
@@ -135,42 +185,53 @@ async def call_gemini(prompt: str, content_parts: list):
 
 # --- ARQ Task Definition ---
 
-async def process_document(ctx: dict, job_id: str, document_id: str):
+async def process_document(ctx: dict, job_id: str, document_id: str, file_id: str, user_id: str, callback_url: Optional[str], job_type: str):
     """ARQ task to process a single document (statement or invoice)."""
-    supabase = get_sync_supabase_client() # Use sync client in worker task
-    logger.info(f"Starting processing for job_id: {job_id}, document_id: {document_id}")
+    supabase = get_sync_supabase_client() # Use sync client for storage download
+    redis_client = get_sync_redis_client() # Use sync client for job status updates
+    logger.info(f"Starting processing for job_id: {job_id}, document_id: {document_id}, file_id: {file_id}")
 
-    # 1. Fetch Job and Document Details
+    # --- 1. Create Initial Job Representation & Set Status in Redis ---
+    initial_job_data = {
+        "id": job_id,
+        "document_id": document_id,
+        "file_id": file_id,
+        "user_id": user_id,
+        "callback_url": callback_url,
+        "job_type": job_type,
+        "status": JobStatus.PROCESSING.value, # Start as processing
+        "created_at": datetime.now(timezone.utc).isoformat(), # Timestamp when worker picked it up
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "results": None, 
+        "error_message": None
+        # Note: Go's CreateJob uses time.Now() which is when API received it.
+        # This uses time.Now() which is when the worker starts. Slight difference.
+    }
     try:
-        job_response = await supabase.table("jobs").select("*, documents(*)").eq("id", job_id).single().execute()
-        job_data = job_response.data
-        doc_data = job_data.get("documents")
+        # Store initial processing status in Redis (overwrite if somehow exists)
+        redis_key = f"job:{job_id}"
+        redis_client.set(redis_key, json.dumps(initial_job_data), ex=24 * 3600) # 24h expiry
+        logger.info(f"Job {job_id}: Initial status PROCESSING set in Redis.")
+    except Exception as redis_err:
+        logger.error(f"Job {job_id}: Failed to set initial status in Redis: {redis_err}. Aborting task.")
+        # If we can't even write to Redis, we can't track progress, so abort.
+        return 
+    # --- End Initial Job Status Update ---
 
-        if not doc_data:
-            raise ValueError("Document data not found for job")
-            
-        await update_job_status(supabase, job_id, JobStatus.PROCESSING)
+    # --- 2. Fetch Document Details (REMOVED) ---
+    file_name_for_logging = file_id # Use file_id for logging
 
-        user_id = doc_data['user_id']
-        file_name = doc_data['file_name']
-        job_type = job_data['job_type'] # 'bank_statement' or 'invoice'
-        
-        # Construct storage path (mirroring upload logic)
-        file_ext = os.path.splitext(file_name)[1].lower()
-        storage_path = f"{user_id}/{document_id}{file_ext}"
-        
-        # Map file type to bucket (similar to upload.py)
+    # --- 3. Download File from Storage --- 
+    # (Supabase client needed here)
+    try:
+        # Map job type to bucket (similar to upload.py)
         bucket_name = "invoices"
         if job_type == "bank_statement":
             bucket_name = "bank_statements"
+        
+        # Use file_id (which includes timestamp and original name) for the storage path
+        storage_path = f"{user_id}/{file_id}" 
 
-    except Exception as e:
-        logger.error(f"Job {job_id}: Failed to fetch job/document details: {e}")
-        await update_job_status(supabase, job_id, JobStatus.FAILED, error_message=f"DB Error: {e}")
-        return
-
-    # 2. Download File from Storage
-    try:
         logger.info(f"Job {job_id}: Downloading {storage_path} from bucket {bucket_name}")
         # Note: supabase-py storage client is sync
         file_bytes = supabase.storage.from_(bucket_name).download(storage_path)
@@ -179,11 +240,13 @@ async def process_document(ctx: dict, job_id: str, document_id: str):
         logger.info(f"Job {job_id}: Downloaded {len(file_bytes)} bytes.")
     except Exception as e:
         logger.error(f"Job {job_id}: Failed to download file {storage_path}: {e}")
-        await update_job_status(supabase, job_id, JobStatus.FAILED, error_message=f"Storage Error: {e}")
+        # Update status to FAILED in Redis
+        await update_job_status_in_redis(redis_client, job_id, JobStatus.FAILED, error_message=f"Storage Error: {e}")
         return
 
-    # 3. Extract Content (PDF/Image)
+    # --- 4. Extract Content (PDF/Image) ---
     content_parts = []
+    file_ext = os.path.splitext(file_id)[1].lower() # Get extension from file_id
     is_pdf = file_ext == ".pdf"
     prompt = BANK_STATEMENT_PROMPT if job_type == 'bank_statement' else INVOICE_PROMPT
 
@@ -193,11 +256,6 @@ async def process_document(ctx: dict, job_id: str, document_id: str):
             logger.info(f"Job {job_id}: Processing {pdf_doc.page_count} pages.")
             for page_num in range(pdf_doc.page_count):
                 page = pdf_doc.load_page(page_num)
-                # Option 1: Extract text (might be less accurate for complex layouts)
-                # text = page.get_text()
-                # if text.strip():
-                #    content_parts.append(text)
-                
                 # Option 2: Extract image (better for Gemini vision)
                 pix = page.get_pixmap()
                 img_bytes = pix.tobytes("png") # Convert to PNG bytes
@@ -205,9 +263,8 @@ async def process_document(ctx: dict, job_id: str, document_id: str):
             pdf_doc.close()
         else: # Handle Images
             img = Image.open(BytesIO(file_bytes))
-            # Convert to PNG or JPEG bytes for Gemini
             output_buffer = BytesIO()
-            img_format = 'png' # Or jpeg
+            img_format = 'png' 
             img.save(output_buffer, format=img_format)
             content_parts.append({"mime_type": f"image/{img_format}", "data": output_buffer.getvalue()})
             logger.info(f"Job {job_id}: Processing image.")
@@ -217,40 +274,46 @@ async def process_document(ctx: dict, job_id: str, document_id: str):
 
     except Exception as e:
         logger.error(f"Job {job_id}: Failed to extract content: {e}")
-        await update_job_status(supabase, job_id, JobStatus.FAILED, error_message=f"Content Extraction Error: {e}")
+        # Update status to FAILED in Redis
+        await update_job_status_in_redis(redis_client, job_id, JobStatus.FAILED, error_message=f"Content Extraction Error: {e}")
         return
 
-    # 4. Call Google AI (Gemini)
+    # 5. Call Google AI (Gemini)
     try:
         logger.info(f"Job {job_id}: Calling Gemini API...")
         ai_response_text = await call_gemini(prompt, content_parts)
         logger.info(f"Job {job_id}: Received response from Gemini.")
-        # logger.debug(f"Job {job_id}: Gemini Raw Response: {ai_response_text}")
 
     except Exception as e:
         logger.error(f"Job {job_id}: Gemini API call failed: {e}")
-        await update_job_status(supabase, job_id, JobStatus.FAILED, error_message=f"AI Error: {e}")
+        # Update status to FAILED in Redis
+        await update_job_status_in_redis(redis_client, job_id, JobStatus.FAILED, error_message=f"AI Error: {e}")
         return
 
-    # 5. Parse AI Response
+    # 6. Parse AI Response
     parsed_results = extract_json_from_text(ai_response_text)
 
     if parsed_results is None:
         logger.error(f"Job {job_id}: Failed to parse JSON from Gemini response.")
-        await update_job_status(supabase, job_id, JobStatus.FAILED, error_message="AI Response Parsing Error")
-        # Optionally save raw response: await update_job_status(..., results={"raw_response": ai_response_text})
+        # Update status to FAILED in Redis
+        await update_job_status_in_redis(redis_client, job_id, JobStatus.FAILED, error_message="AI Response Parsing Error")
         return
         
-    # Basic validation/cleaning (optional)
-    # e.g., ensure confidence_score exists
     if 'confidence_score' not in parsed_results:
-        parsed_results['confidence_score'] = 0.0 # Assign default if missing
+        parsed_results['confidence_score'] = 0.0 
         logger.warning(f"Job {job_id}: Confidence score missing from AI response, set to 0.0")
 
     logger.info(f"Job {job_id}: Successfully parsed AI response.")
 
-    # 6. Update Job Status and Results
-    await update_job_status(supabase, job_id, JobStatus.COMPLETED, results=parsed_results)
+    # 7. Update Job Status and Results in Redis
+    await update_job_status_in_redis(redis_client, job_id, JobStatus.COMPLETED, results=parsed_results)
+
+    # 8. Optional: Send Callback (if callback_url exists)
+    # You would need a function similar to Go's SendCallback here, using httpx
+    if callback_url:
+        logger.info(f"Job {job_id}: Callback URL detected, attempting to send callback.")
+        # await send_callback_notification(job_id, JobStatus.COMPLETED, parsed_results, callback_url) # Implement this function if needed
+        pass # Placeholder
 
     logger.info(f"Finished processing job_id: {job_id}")
 

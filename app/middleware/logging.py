@@ -76,6 +76,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         self.supabase = supabase
 
     async def dispatch(self, request: Request, call_next):
+        print(f"Executing in: logging.py - dispatch for {request.method} {request.url.path}")
         # Start timer
         start_time = time.time()
         

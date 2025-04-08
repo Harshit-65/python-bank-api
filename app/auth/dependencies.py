@@ -78,6 +78,7 @@ async def _perform_key_verification(api_key: str, supabase: Client) -> Dict[str,
     Raises specific HTTPExceptions on failure.
     Returns user data dictionary (user_id, api_key_id) on success.
     """
+    print("Executing in: dependencies.py - _perform_key_verification")
     # 1. Verify with Keyfolio
     async with httpx.AsyncClient() as client:
         try:
@@ -120,6 +121,7 @@ async def verify_api_key(request: Request,
     This function now primarily acts as a wrapper for the core logic
     and handles storing data in request.state.
     """
+    print("Executing in: dependencies.py - verify_api_key")
     if token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

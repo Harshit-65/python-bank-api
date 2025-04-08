@@ -1,16 +1,29 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
-
 from .middleware.logging import LoggingMiddleware
-from .auth.dependencies import AuthData # Example import
-from .api.routers import health, upload, jobs # <-- Import new routers
+from .api.routers import health, upload, jobs
 from .db.supabase_client import get_supabase_client
+from .queue.arq_client import init_arq_pool, close_arq_pool
 
-# Create FastAPI app instance
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize dependencies
+    print("Executing in: main.py - lifespan start")
+    await init_arq_pool()
+    supabase = get_supabase_client()
+    
+    yield  # Application runs here
+    
+    # Cleanup
+    print("Executing in: main.py - lifespan end")
+    await close_arq_pool()
+    await supabase.auth.close()
+
 app = FastAPI(
     title="Python Bank API",
     description="Migrated Bank API service",
     version="1.0.0",
-    # Add OpenAPI tags metadata for better documentation
+    lifespan=lifespan,
     openapi_tags=[
         {"name": "Health", "description": "Service health checks"},
         {"name": "Upload", "description": "File upload operations"},
@@ -18,31 +31,17 @@ app = FastAPI(
     ]
 )
 
-# Add Middleware
-# LoggingMiddleware should typically be one of the first middleware added
-supabase = get_supabase_client()
-app.add_middleware(LoggingMiddleware, supabase=supabase)
+# Add middleware
+print("Executing in: main.py - Registering Middleware")
+app.add_middleware(LoggingMiddleware, supabase=get_supabase_client())
 
-# --- Add Routers ---
-# It's often good practice to prefix API routes with /api/v1 or similar
+# Configure routes
+print("Executing in: main.py - Including Routers")
 API_PREFIX = "/api/v1"
+app.include_router(health.router, prefix=API_PREFIX, tags=["Health"])
+app.include_router(upload.router, prefix=API_PREFIX + "/parse", tags=["Upload"])
+app.include_router(jobs.router, prefix=API_PREFIX + "/parse", tags=["Parsing Jobs"])
 
-app.include_router(health.router, prefix=API_PREFIX, tags=["Health"]) # Unauthenticated usually
-app.include_router(upload.router, prefix=API_PREFIX + "/parse", tags=["Upload"]) # Requires auth
-app.include_router(jobs.router, prefix=API_PREFIX + "/parse", tags=["Parsing Jobs"]) # Requires auth
-
-# --- Root Endpoint (Optional) ---
 @app.get("/", include_in_schema=False)
 async def root():
     return {"message": "Welcome to the Python Bank API"}
-
-
-# --- Example Protected Route (Keep or remove) ---
-# @app.get(API_PREFIX + "/items/") # Add prefix
-# async def read_items(auth: AuthData): 
-#     """Example endpoint protected by authentication."""
-#     return create_success_response(data=[{"item_id": "Foo", "user": auth["user_id"]}])
-
-# Add routers later, e.g.:
-# from .api import items_router
-# app.include_router(items_router, prefix="/api/v1") 

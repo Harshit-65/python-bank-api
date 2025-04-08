@@ -11,3 +11,4 @@ PyMuPDF>=1.23.0 # For PDF validation/parsing
 arq[redis]>=0.25.0 # Async task queue
 google-generativeai>=0.4.0 # Google AI Client
 Pillow>=10.0.0 # For image handling 
+redis>=5.0.0 # Sync Redis client for worker tasks

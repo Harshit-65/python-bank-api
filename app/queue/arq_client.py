@@ -1,44 +1,49 @@
 import logging
 import os
-from typing import Any, Optional, Dict
-from arq import create_pool
+from typing import Any, Dict
+from arq import create_pool, ArqRedis
 from arq.connections import RedisSettings
-
 from ..config import RedisSettings as AppRedisSettings
 
 logger = logging.getLogger(__name__)
 
+# Shared Redis settings
 arq_redis_settings = RedisSettings(
     host=AppRedisSettings.redis_url.split("://")[1].split(":")[0],
     port=int(AppRedisSettings.redis_url.split(":")[2].split("/")[0]),
-    # Add password handling if your Redis requires it
     password=os.getenv("REDIS_PASSWORD"),
 )
 
-async def get_arq_redis():
+# Global pool reference
+arq_pool: ArqRedis | None = None
+
+async def get_arq_redis() -> ArqRedis:
     """FastAPI dependency to get ARQ Redis pool."""
-    # Note: For simplicity, creating pool here.
-    # In complex apps, manage pool lifecycle with app startup/shutdown events.
-    redis = await create_pool(arq_redis_settings)
-    return redis
+    print("Executing in: arq_client.py - get_arq_redis")
+    if arq_pool is None:
+        raise RuntimeError("ARQ Redis pool accessed before initialization")
+    return arq_pool
+
+async def init_arq_pool():
+    """Initialize the global ARQ pool (called from lifespan)"""
+    global arq_pool
+    arq_pool = await create_pool(arq_redis_settings)
+    logger.info("ARQ Redis pool initialized")
+
+async def close_arq_pool():
+    """Close the global ARQ pool (called from lifespan)"""
+    global arq_pool
+    if arq_pool:
+        await arq_pool.close()
+        arq_pool = None
+        logger.info("ARQ Redis pool closed")
 
 async def enqueue_job(ctx: Any, function_name: str, job_params: Dict[str, Any]):
     """Enqueues a job using the ARQ client from the context."""
     try:
-        redis = ctx.get("arq_redis")
-        if not redis:
-            logger.error("ARQ Redis client not found in context.")
-            # In a real app, might fallback to creating a pool or raise an error
-            # For now, try creating a temporary pool (less efficient)
-            redis = await create_pool(arq_redis_settings)
-            if not redis:
-                raise ConnectionError("Failed to connect to ARQ Redis")
-            await redis.enqueue_job(function_name, **job_params)
-            await redis.close()
-        else:
-            await redis.enqueue_job(function_name, **job_params)
-        logger.info(f"Enqueued job '{function_name}' with params: {job_params}")
+        redis = await get_arq_redis()
+        await redis.enqueue_job(function_name, **job_params)
+        logger.info(f"Enqueued job '{function_name}'")
     except Exception as e:
         logger.error(f"Error enqueuing job '{function_name}': {e}")
-        # Decide how to handle enqueue errors (e.g., raise exception, retry)
-        raise 
+        raise
