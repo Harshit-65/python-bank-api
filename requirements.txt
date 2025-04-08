@@ -1,0 +1,13 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+pydantic>=2.0.0
+httpx>=0.25.0
+supabase>=1.0.0
+supabase[storage]>=1.0.0
+python-dotenv>=1.0.0
+pytest>=7.0.0  # For testing
+respx>=0.20.0  # For mocking HTTP requests in tests 
+PyMuPDF>=1.23.0 # For PDF validation/parsing 
+arq[redis]>=0.25.0 # Async task queue
+google-generativeai>=0.4.0 # Google AI Client
+Pillow>=10.0.0 # For image handling 
