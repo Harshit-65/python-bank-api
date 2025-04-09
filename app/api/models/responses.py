@@ -21,6 +21,8 @@ class UploadResponseModel(BaseModel):
 class JobCreatedResponseModel(BaseModel):
     job_id: str
     status: JobStatus
+    created_at: datetime
+    updated_at: datetime
 
 class JobStatusResponseModel(BaseModel):
     job_id: str

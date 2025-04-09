@@ -8,6 +8,10 @@ from arq.connections import ArqRedis
 import json
 import redis # Import redis library
 from ...config import REDIS_URL, REDIS_PASSWORD # Import redis config
+import logging # Import logging
+
+# Get logger instance
+logger = logging.getLogger(__name__)
 
 from ...db.supabase_client import get_supabase_client
 from ...auth.dependencies import AuthData
@@ -200,8 +204,15 @@ async def submit_statement_job(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to enqueue job: {e}")
 
     # 4. Return Job ID and Accepted status
-    response_data = JobCreatedResponseModel(job_id=job_id, status=JobStatus.PENDING)
-    return create_success_response(data=response_data.model_dump(), status_code=status.HTTP_202_ACCEPTED)
+    now = datetime.now(timezone.utc)
+    response_data = JobCreatedResponseModel(
+        job_id=job_id, 
+        status=JobStatus.PENDING,
+        created_at=now, # Include current time
+        updated_at=now  # Include current time
+        )
+    # Use mode='json' to serialize datetime objects correctly
+    return create_success_response(data=response_data.model_dump(mode='json'), status_code=status.HTTP_202_ACCEPTED)
     # return {"test_received": request_data.test, "status": "test passed validation - dependencies removed"} # <-- Removed test return
 
 @router.get("/statements/{job_id}", 
@@ -247,7 +258,8 @@ async def get_statement_job_status(
             created_at=created_at_str, # Pass string, Pydantic converts
             updated_at=updated_at_str, # Pass string, Pydantic converts
         )
-        return create_success_response(data=response_data.model_dump(exclude_none=True))
+        # Use mode='json' to handle datetime serialization
+        return create_success_response(data=response_data.model_dump(mode='json', exclude_none=True))
 
     except json.JSONDecodeError:
          logger.error(f"Job {job_id}: Failed to decode job JSON from Redis: {job_json}")
@@ -259,190 +271,290 @@ async def get_statement_job_status(
         logger.error(f"Job {job_id}: Unexpected error fetching job status: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error.")
 
-# @router.get("/statements", 
-#              response_model=PaginatedJobResponse, 
-#              summary="List Bank Statement Jobs",
-#              description="Lists bank statement parsing jobs for the authenticated user, with optional status filtering and pagination.")
-# async def list_statement_jobs(
-#     auth: AuthData,
-#     supabase: Annotated[Client, Depends(get_supabase_client)],
-#     pagination: Annotated[PaginationParams, Depends()], 
-# ):
-#     \"\"\"List all bank statement parsing jobs.\"\"\"
-#     user_id = auth["user_id"]
+# --- NEW --- List Statement Jobs Endpoint ---
+@router.get("/statements", 
+             response_model=PaginatedJobResponse, 
+             summary="List Bank Statement Jobs",
+             description="Lists bank statement parsing jobs for the authenticated user, fetching from Redis with optional status filtering and pagination.")
+async def list_statement_jobs(
+    auth: AuthData,
+    redis_client: Annotated[redis.Redis, Depends(get_sync_redis_client_for_api)],
+    pagination: Annotated[PaginationParams, Depends()], 
+):
+    """List all bank statement parsing jobs from Redis."""
+    user_id = auth["user_id"]
+    job_type_filter = "bank_statement"
     
-#     jobs_data, total_count = await list_jobs_from_db(supabase, user_id, "bank_statement", pagination)
+    filtered_jobs = []
+    try:
+        # Iterate through all job keys in Redis
+        for key in redis_client.scan_iter("job:*"):
+            job_json = redis_client.get(key)
+            if not job_json:
+                continue
+            
+            try:
+                job_data = json.loads(job_json)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to decode JSON for key {key}. Skipping.")
+                continue
+
+            # --- Apply Filters ---
+            # 1. Filter by User ID (Essential Security)
+            if job_data.get("user_id") != user_id:
+                continue
+            # 2. Filter by Job Type
+            if job_data.get("job_type") != job_type_filter:
+                continue
+            # 3. Filter by Status (if provided)
+            if pagination.status and job_data.get("status") != pagination.status.value:
+                continue
+            
+            # Add job to list if all filters pass
+            filtered_jobs.append(job_data)
+            
+    except redis.RedisError as e:
+        logger.error(f"Redis error listing jobs for user {user_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list jobs due to cache error.")
+
+    # --- Sort by creation date (descending) ---
+    # Use isoformat string comparison (should work for standard format)
+    filtered_jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
     
-#     job_responses = []
-#     for job in jobs_data:
-#         results_dict = None
-#         if job.get("results"): 
-#             try:
-#                 results_dict = json.loads(job["results"])
-#             except json.JSONDecodeError:
-#                 results_dict = {"error": "Failed to parse results JSON"}
-        
-#         job_responses.append(
-#             JobStatusResponseModel( # Use JobStatusResponseModel for lists
-#                 job_id=job["id"],
-#                 status=JobStatus(job["status"]), 
-#                 result=results_dict, 
-#                 error_message=job.get("error_message"),
-#                 created_at=datetime.fromisoformat(job["created_at"]), 
-#                 updated_at=datetime.fromisoformat(job["updated_at"]),
-#                 file_id=job.get("documents", {}).get("file_name") # Get filename if joined
-#             )
-#         )
+    # --- Apply Pagination ---
+    total_count = len(filtered_jobs)
+    start_index = (pagination.page - 1) * pagination.page_size
+    end_index = start_index + pagination.page_size
+    paginated_job_data = filtered_jobs[start_index:end_index]
+    
+    # --- Format Response Items ---
+    job_responses = []
+    for job in paginated_job_data:
+        # Use JobStatusResponseModel for list items (as previously defined)
+        job_responses.append(
+            JobStatusResponseModel(
+                job_id=job.get("id", "unknown"),
+                status=JobStatus(job.get("status", JobStatus.FAILED)),
+                # Results are generally not included in list views for brevity
+                # result=job.get("result"), 
+                error_message=job.get("error_message"),
+                created_at=job.get("created_at"),
+                updated_at=job.get("updated_at"),
+                file_id=job.get("file_id") 
+            )
+        )
 
-#     total_pages = math.ceil(total_count / pagination.page_size) if pagination.page_size > 0 else 0
+    total_pages = math.ceil(total_count / pagination.page_size) if pagination.page_size > 0 else 0
 
-#     response_data = PaginatedJobResponse(
-#         jobs=job_responses,
-#         total=total_count,
-#         page=pagination.page,
-#         page_size=pagination.page_size,
-#         total_pages=total_pages
-#     )
+    # --- Construct Final Paginated Response --- 
+    response_data = PaginatedJobResponse(
+        jobs=job_responses,
+        total=total_count,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        total_pages=total_pages
+    )
 
-#     return create_success_response(data=response_data.model_dump(exclude_none=True))
+    # Return the dictionary output of model_dump(mode='json')
+    return create_success_response(data=response_data.model_dump(mode='json', exclude_none=True))
 
 # --- Invoice Endpoints ---
-# @router.post("/invoices", 
-#               response_model=JobCreatedResponseModel, 
-#               status_code=status.HTTP_202_ACCEPTED, 
-#               summary="Submit Invoice for Parsing",
-#               description="Submits an invoice (previously uploaded) for parsing.")
-# async def submit_invoice_job(
-#     request_data: ParseRequestModel,
-#     auth: AuthData,
-#     supabase: Annotated[Client, Depends(get_supabase_client)],
-#     arq_redis: Annotated[ArqRedis, Depends(get_arq_redis)]
-# ):
-#     \"\"\"Submit an invoice for parsing.\"\"\"
-#     user_id = auth["user_id"]
-#     doc_id = request_data.document_id # Use document_id from request
+@router.post("/invoices", 
+              response_model=JobCreatedResponseModel, 
+              status_code=status.HTTP_202_ACCEPTED, 
+              summary="Submit Invoice for Parsing",
+              description="Submits an invoice (previously uploaded) for parsing.")
+async def submit_invoice_job(
+    request_data: ParseRequestModel,
+    auth: AuthData,
+    supabase: Annotated[Client, Depends(get_supabase_client)],
+    arq_redis: Annotated[ArqRedis, Depends(get_arq_redis)]
+):
+    """Submit an invoice for parsing."""
+    user_id = auth["user_id"]
+    doc_id = request_data.document_id # Use document_id from request
 
-#     # 1. Verify document exists and belongs to user
-#     doc_info = await verify_document_access(supabase, doc_id, user_id)
-#     if doc_info.get("document_type") != "invoice":
-#         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Document {doc_id} is not an invoice.")
+    # 1. Verify document exists and belongs to user
+    doc_info = await verify_document_access(supabase, doc_id, user_id)
+    if doc_info.get("document_type") != "invoice":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Document {doc_id} is not an invoice.")
 
-#     # 2. Create Job Record
-#     job_id = f"job_{uuid.uuid4()}"
-#     job_record = {
-#         "id": job_id,
-#         "document_id": doc_id,
-#         "status": JobStatus.PENDING.value,
-#         "callback_url": str(request_data.callback_url) if request_data.callback_url else None,
-#         "job_type": "invoice", 
-#         "user_id": user_id,
-#         "created_at": datetime.now(timezone.utc).isoformat(),
-#         "updated_at": datetime.now(timezone.utc).isoformat(),
-#     }
-#     try:
-#         response = await supabase.table("jobs").insert(job_record).execute()
-#         if hasattr(response, 'error') and response.error:
-#              raise Exception(f"Supabase error: {response.error}")
-#     except Exception as e:
-#         print(f"Error creating job record for doc {doc_id}: {e}")
-#         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create job record")
+    # 2. Create Job ID (Record creation deferred to worker)
+    job_id = f"job_{uuid.uuid4()}"
+    # --- REMOVED DB INSERT ---
+    # job_record = { ... }
+    # try:
+    #     response = await supabase.table("jobs").insert(job_record).execute()
+    #     ...
+    # except Exception as e:
+    #     ...
 
-#     # 3. Enqueue the ARQ Task
-#     try:
-#         ctx = {"arq_redis": arq_redis}
-#         job_params = {"job_id": job_id, "document_id": doc_id}
-#         await enqueue_job(ctx, "process_document", job_params)
-#     except Exception as e:
-#         print(f"Error enqueuing job {job_id}: {e}. Updating job status to failed.")
-#         try:
-#             await supabase.table("jobs").update({"status": JobStatus.FAILED.value, "error_message": "Enqueue failed"}).eq("id", job_id).execute()
-#         except Exception as db_err:
-#             print(f"Error updating job {job_id} status to failed after enqueue error: {db_err}")
-#         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to enqueue job: {e}")
+    # 3. Enqueue the ARQ Task
+    try:
+        ctx = {"arq_redis": arq_redis}
+        # Pass all necessary info for the worker 
+        job_params = {
+            "job_id": job_id, 
+            "document_id": doc_id,
+            "file_id": request_data.file_id, # Pass file_id
+            "user_id": user_id, # Pass user_id
+            "callback_url": str(request_data.callback_url) if request_data.callback_url else None, # Pass callback_url
+            "job_type": "invoice" # Set job_type to invoice
+        }
+        await enqueue_job(ctx, "process_document", job_params)
+        print(f"Enqueued job {job_id} with params: {job_params}")
+    except Exception as e:
+        print(f"Fatal error: Failed to enqueue job {job_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to enqueue job: {e}")
 
-#     # 4. Return Job ID and Accepted status
-#     response_data = JobCreatedResponseModel(job_id=job_id, status=JobStatus.PENDING)
-#     return create_success_response(data=response_data.model_dump(), status_code=status.HTTP_202_ACCEPTED)
+    # 4. Return Job ID and Accepted status with timestamps
+    now = datetime.now(timezone.utc)
+    response_data = JobCreatedResponseModel(
+        job_id=job_id, 
+        status=JobStatus.PENDING,
+        created_at=now, 
+        updated_at=now
+        )
+    return create_success_response(data=response_data.model_dump(mode='json'), status_code=status.HTTP_202_ACCEPTED)
 
-# @router.get("/invoices/{job_id}", 
-#              response_model=JobResponseModel, # Use JobResponseModel 
-#              summary="Get Invoice Job Status",
-#              description="Retrieves the status and results (if available) of a specific invoice parsing job.")
-# async def get_invoice_job_status(
-#     job_id: Annotated[str, Path(description="The ID of the job to retrieve.")],
-#     auth: AuthData,
-#     supabase: Annotated[Client, Depends(get_supabase_client)],
-# ):
-#     \"\"\"Get the status of an invoice parsing job.\"\"\"
-#     user_id = auth["user_id"]
-#     job_data = await get_job_from_db(supabase, job_id, user_id)
+@router.get("/invoices/{job_id}", 
+             response_model=JobResponseModel, 
+             summary="Get Invoice Job Status",
+             description="Retrieves the status and results (if available) of a specific invoice parsing job from Redis.")
+async def get_invoice_job_status(
+    job_id: Annotated[str, Path(description="The ID of the job to retrieve.")],
+    auth: AuthData,
+    # supabase: Annotated[Client, Depends(get_supabase_client)], # No longer needed
+    redis_client: Annotated[redis.Redis, Depends(get_sync_redis_client_for_api)] # Inject Redis client
+):
+    """Get the status of an invoice parsing job from Redis."""
+    user_id = auth["user_id"]
+    # This function now fetches from Redis
+    # job_data = await get_job_from_db(supabase, job_id, user_id)
+    redis_key = f"job:{job_id}"
 
-#     if not job_data:
-#         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job with ID '{job_id}' not found or access denied.")
-    
-#     results_dict = None
-#     if job_data.get("results"): 
-#         try:
-#             results_dict = json.loads(job_data["results"])
-#         except json.JSONDecodeError:
-#             results_dict = {"error": "Failed to parse results JSON"}
+    try:
+        job_json = redis_client.get(redis_key)
+        if not job_json:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job with ID '{job_id}' not found.")
 
-#     response_data = JobResponseModel(
-#         job_id=job_data["id"],
-#         status=JobStatus(job_data["status"]), 
-#         result=results_dict, 
-#         error=job_data.get("error_message"),
-#         created_at=datetime.fromisoformat(job_data["created_at"]), 
-#         updated_at=datetime.fromisoformat(job_data["updated_at"]), 
-#     )
-#     return create_success_response(data=response_data.model_dump(exclude_none=True))
-
-# @router.get("/invoices", 
-#              response_model=PaginatedJobResponse, 
-#              summary="List Invoice Jobs",
-#              description="Lists invoice parsing jobs for the authenticated user, with optional status filtering and pagination.")
-# async def list_invoice_jobs(
-#     auth: AuthData,
-#     supabase: Annotated[Client, Depends(get_supabase_client)],
-#     pagination: Annotated[PaginationParams, Depends()], 
-# ):
-#     \"\"\"List all invoice parsing jobs.\"\"\"
-#     user_id = auth["user_id"]
-    
-#     jobs_data, total_count = await list_jobs_from_db(supabase, user_id, "invoice", pagination)
-    
-#     job_responses = []
-#     for job in jobs_data:
-#         results_dict = None
-#         if job.get("results"): 
-#             try:
-#                 results_dict = json.loads(job["results"])
-#             except json.JSONDecodeError:
-#                 results_dict = {"error": "Failed to parse results JSON"}
+        job_data = json.loads(job_json)
         
-#         job_responses.append(
-#             JobStatusResponseModel( # Use JobStatusResponseModel for lists
-#                 job_id=job["id"],
-#                 status=JobStatus(job["status"]), 
-#                 result=results_dict, 
-#                 error_message=job.get("error_message"),
-#                 created_at=datetime.fromisoformat(job["created_at"]), 
-#                 updated_at=datetime.fromisoformat(job["updated_at"]), 
-#                 file_id=job.get("documents", {}).get("file_name") 
-#             )
-#         )
+        # Optional: Verify ownership 
+        if job_data.get("user_id") != user_id:
+             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to this job.")
+        
+        # Ensure job type is correct (optional but good practice)
+        if job_data.get("job_type") != "invoice":
+            logger.warning(f"Job {job_id} fetched via /invoices endpoint has incorrect job_type: {job_data.get('job_type')}")
+            # Depending on desired behavior, could raise 404 or proceed
+            # raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job with ID '{job_id}' is not an invoice job.")
 
-#     total_pages = math.ceil(total_count / pagination.page_size) if pagination.page_size > 0 else 0
+        created_at_str = job_data.get("created_at")
+        updated_at_str = job_data.get("updated_at")
 
-#     response_data = PaginatedJobResponse(
-#         jobs=job_responses,
-#         total=total_count,
-#         page=pagination.page,
-#         page_size=pagination.page_size,
-#         total_pages=total_pages
-#     )
+        response_data = JobResponseModel(
+            job_id=job_data.get("id", job_id),
+            status=JobStatus(job_data.get("status", JobStatus.FAILED)), 
+            result=job_data.get("result"),
+            error=job_data.get("error_message"),
+            created_at=created_at_str, 
+            updated_at=updated_at_str, 
+        )
+        return create_success_response(data=response_data.model_dump(mode='json', exclude_none=True))
 
-#     return create_success_response(data=response_data.model_dump(exclude_none=True))
+    except json.JSONDecodeError:
+         logger.error(f"Job {job_id}: Failed to decode job JSON from Redis: {job_json}")
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse job data.")
+    except redis.RedisError as e:
+        logger.error(f"Job {job_id}: Redis error fetching job: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve job status.")
+    except Exception as e:
+        logger.error(f"Job {job_id}: Unexpected error fetching job status: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error.")
+
+# --- NEW --- List Invoice Jobs Endpoint ---
+@router.get("/invoices", 
+             response_model=PaginatedJobResponse, 
+             summary="List Invoice Jobs",
+             description="Lists invoice parsing jobs for the authenticated user, fetching from Redis with optional status filtering and pagination.")
+async def list_invoice_jobs(
+    auth: AuthData,
+    redis_client: Annotated[redis.Redis, Depends(get_sync_redis_client_for_api)],
+    pagination: Annotated[PaginationParams, Depends()], 
+):
+    """List all invoice parsing jobs from Redis."""
+    user_id = auth["user_id"]
+    job_type_filter = "invoice" # Only change is this filter
+    
+    filtered_jobs = []
+    try:
+        # Iterate through all job keys in Redis
+        for key in redis_client.scan_iter("job:*"):
+            job_json = redis_client.get(key)
+            if not job_json:
+                continue
+            
+            try:
+                job_data = json.loads(job_json)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to decode JSON for key {key}. Skipping.")
+                continue
+
+            # --- Apply Filters ---
+            # 1. Filter by User ID (Essential Security)
+            if job_data.get("user_id") != user_id:
+                continue
+            # 2. Filter by Job Type
+            if job_data.get("job_type") != job_type_filter:
+                continue
+            # 3. Filter by Status (if provided)
+            if pagination.status and job_data.get("status") != pagination.status.value:
+                continue
+            
+            # Add job to list if all filters pass
+            filtered_jobs.append(job_data)
+            
+    except redis.RedisError as e:
+        logger.error(f"Redis error listing jobs for user {user_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list jobs due to cache error.")
+
+    # --- Sort by creation date (descending) ---
+    filtered_jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+    
+    # --- Apply Pagination ---
+    total_count = len(filtered_jobs)
+    start_index = (pagination.page - 1) * pagination.page_size
+    end_index = start_index + pagination.page_size
+    paginated_job_data = filtered_jobs[start_index:end_index]
+    
+    # --- Format Response Items ---
+    job_responses = []
+    for job in paginated_job_data:
+        job_responses.append(
+            JobStatusResponseModel(
+                job_id=job.get("id", "unknown"),
+                status=JobStatus(job.get("status", JobStatus.FAILED)),
+                error_message=job.get("error_message"),
+                created_at=job.get("created_at"),
+                updated_at=job.get("updated_at"),
+                file_id=job.get("file_id") 
+            )
+        )
+
+    total_pages = math.ceil(total_count / pagination.page_size) if pagination.page_size > 0 else 0
+
+    # --- Construct Final Paginated Response --- 
+    response_data = PaginatedJobResponse(
+        jobs=job_responses,
+        total=total_count,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        total_pages=total_pages
+    )
+
+    # Return the dictionary output of model_dump(mode='json')
+    return create_success_response(data=response_data.model_dump(mode='json', exclude_none=True))
 
 # --- Batch Processing Endpoints --- #
 
