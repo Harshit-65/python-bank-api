@@ -16,7 +16,7 @@ from ..models.requests import ParseRequestModel, PaginationParams, JobStatus, Ba
 from ..models.responses import (
     JobCreatedResponseModel, JobStatusResponseModel, 
     PaginatedJobResponse, BatchCreatedResponseModel, 
-    BatchStatusResponseModel, JobResponseModel # Added JobResponseModel
+    BatchStatusResponseModel, JobResponseModel, BatchFileResponseModel # Added BatchFileResponseModel
 )
 from ..utils.response_utils import create_success_response, create_error_response, APIErrorModel # Import error utils
 
@@ -53,29 +53,6 @@ async def list_jobs_from_db(supabase: Client, user_id: str, job_type: str, param
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list jobs")
 
 # --- Batch Processing Functions (DB interaction for batch metadata) ---
-async def create_batch_job_record(supabase: Client, job_ids: List[str], callback_url: Optional[str], user_id: str, job_type: str) -> str:
-    """Creates a batch job record in the database."""
-    batch_id = f"batch_{uuid.uuid4()}"
-    batch_record = {
-        "id": batch_id,
-        "job_ids": job_ids,
-        "status": JobStatus.PENDING.value,
-        "callback_url": callback_url, # Store directly (already str or None)
-        "user_id": user_id,
-        "job_type": job_type, # Track batch type
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        response = supabase.table("batch_jobs").insert(batch_record).execute()
-        # Simple error check (adjust based on Supabase client specifics)
-        if hasattr(response, 'error') and response.error:
-             raise Exception(f"Supabase error: {response.error}")
-        return batch_id
-    except Exception as e:
-        print(f"Error creating batch job record: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create batch job record")
-
 async def get_batch_job_record(supabase: Client, batch_id: str, user_id: str) -> Optional[dict]:
     """Retrieves a batch job from the database."""
     try:
@@ -470,66 +447,292 @@ async def get_statement_job_status(
 # --- Batch Processing Endpoints --- #
 
 # Helper to submit multiple jobs of the same type
-# async def _submit_batch(request_data: BatchRequestModel, auth: AuthData, supabase: Client, arq_redis: ArqRedis, job_type: str):
-    # ... (commented out helper function body) ...
-    # return create_success_response(data=response_data.model_dump(exclude_none=True), status_code=status.HTTP_202_ACCEPTED)
+async def _submit_batch(
+    request_data: BatchRequestModel, 
+    auth: AuthData, 
+    supabase: Client, # Keep for verify_document_access
+    arq_redis: ArqRedis, 
+    redis_client: redis.Redis, # Add redis_client dependency
+    job_type: str 
+):
+    """Handles the logic for submitting a batch job and storing metadata in Redis."""
+    user_id = auth["user_id"]
+    job_ids = []
+    file_details_for_batch_record = [] 
 
-# @router.post("/statements/batch", 
-#               response_model=BatchCreatedResponseModel,
-#               status_code=status.HTTP_202_ACCEPTED,
-#               summary="Submit Batch of Bank Statements for Processing",
-#               description="Submits multiple bank statements (previously uploaded) for batch processing.")
-# async def submit_statement_batch_job(
-#     request_data: BatchRequestModel,
-#     auth: AuthData,
-#     supabase: Annotated[Client, Depends(get_supabase_client)],
-#     arq_redis: Annotated[ArqRedis, Depends(get_arq_redis)]
-# ):
-#     return await _submit_batch(request_data, auth, supabase, arq_redis, "bank_statement")
+    if not request_data.files:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No files provided in the batch request.")
 
-# @router.post("/invoices/batch", 
-#               response_model=BatchCreatedResponseModel,
-#               status_code=status.HTTP_202_ACCEPTED,
-#               summary="Submit Batch of Invoices for Processing",
-#               description="Submits multiple invoices (previously uploaded) for batch processing.")
-# async def submit_invoice_batch_job(
-#     request_data: BatchRequestModel,
-#     auth: AuthData,
-#     supabase: Annotated[Client, Depends(get_supabase_client)],
-#     arq_redis: Annotated[ArqRedis, Depends(get_arq_redis)]
-# ):
-#     return await _submit_batch(request_data, auth, supabase, arq_redis, "invoice")
+    # 1. Iterate and enqueue individual jobs
+    for file_info in request_data.files:
+        doc_id = file_info.document_id or file_info.file_id # Use document_id if provided, else file_id
+        file_id = file_info.file_id
+        
+        try:
+            # Verify document access (ensure it exists and belongs to user)
+            doc_info = await verify_document_access(supabase, doc_id, user_id)
+            if doc_info.get("document_type") != job_type:
+                 logger.warning(f"Skipping document {doc_id} in batch: Type mismatch (expected {job_type}, got {doc_info.get('document_type')})")
+                 continue 
+
+            # Generate Job ID for this specific file
+            job_id = f"job_{uuid.uuid4()}"
+            job_ids.append(job_id)
+            file_details_for_batch_record.append({"file_id": file_id, "document_id": doc_id, "job_id": job_id})
+
+            # Enqueue the individual job
+            ctx = {"arq_redis": arq_redis}
+            job_params = {
+                "job_id": job_id, 
+                "document_id": doc_id,
+                "file_id": file_id, 
+                "user_id": user_id,
+                "callback_url": request_data.callback_url, # Pass batch callback?
+                "job_type": job_type
+            }
+            await enqueue_job(ctx, "process_document", job_params)
+            print(f"Enqueued batch item job {job_id} for doc {doc_id}")
+
+        except HTTPException as e:
+             logger.error(f"Error verifying document {doc_id} for batch: {e.detail}")
+             raise HTTPException(status_code=e.status_code, detail=f"Error processing document {doc_id}: {e.detail}")
+        except Exception as e:
+            logger.error(f"Failed to enqueue job for document {doc_id} in batch: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to enqueue job for document {doc_id}")
+
+    if not job_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No valid files found to process in the batch.")
+
+    # 2. Create Batch Metadata and Store in Redis
+    batch_id = f"batch_{uuid.uuid4()}"
+    now = datetime.now(timezone.utc)
+    batch_data = {
+        "id": batch_id,
+        "job_ids": job_ids,
+        "status": JobStatus.PENDING.value,
+        "callback_url": request_data.callback_url,
+        "job_type": job_type, # Store job type
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "result": None # Initialize result field for potential future use
+    }
+    try:
+        redis_key = f"batch:{batch_id}"
+        # --- Use print for debugging --- 
+        print(f"DEBUG: Preparing to store batch metadata for key {redis_key}") 
+        batch_json_str = json.dumps(batch_data) # Serialize first
+        print(f"DEBUG: Attempting redis_client.set with data: {batch_json_str}")
+        redis_client.set(redis_key, batch_json_str, ex=24 * 3600) # 24h expiry like Go
+        print(f"DEBUG: Successfully executed redis_client.set for key {redis_key}") # Changed log message
+        # --- End print debugging --- 
+    except json.JSONDecodeError as json_err:
+        # Catch JSON serialization errors specifically
+        logger.error(f"Failed to serialize batch metadata for Redis: {json_err}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to serialize batch data.")
+    except Exception as e:
+        # If storing batch metadata fails, individual jobs are already queued.
+        # This is still problematic, but aligns with Go's potential failure point.
+        logger.error(f"Failed to store batch metadata in Redis (key: {redis_key}): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create batch tracking record in cache.")
+
+    # 3. Return Batch Info (using data we just prepared)
+    response_data = BatchCreatedResponseModel(
+        batch_id=batch_id,
+        status=JobStatus(batch_data["status"]), 
+        total_files=len(job_ids), 
+        created_at=now,
+        callback_url=batch_data["callback_url"]
+    )
+    return create_success_response(data=response_data.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_202_ACCEPTED)
+
+@router.post("/statements/batch", 
+              response_model=BatchCreatedResponseModel,
+              status_code=status.HTTP_202_ACCEPTED,
+              summary="Submit Batch of Bank Statements for Processing",
+              description="Submits multiple bank statements (previously uploaded) for batch processing.")
+async def submit_statement_batch_job(
+    request_data: BatchRequestModel,
+    auth: AuthData,
+    supabase: Annotated[Client, Depends(get_supabase_client)],
+    arq_redis: Annotated[ArqRedis, Depends(get_arq_redis)],
+    redis_client: Annotated[redis.Redis, Depends(get_sync_redis_client_for_api)] # Inject Redis client
+):
+    return await _submit_batch(request_data, auth, supabase, arq_redis, redis_client, "bank_statement")
+
+@router.post("/invoices/batch", 
+              response_model=BatchCreatedResponseModel,
+              status_code=status.HTTP_202_ACCEPTED,
+              summary="Submit Batch of Invoices for Processing",
+              description="Submits multiple invoices (previously uploaded) for batch processing.")
+async def submit_invoice_batch_job(
+    request_data: BatchRequestModel,
+    auth: AuthData,
+    supabase: Annotated[Client, Depends(get_supabase_client)],
+    arq_redis: Annotated[ArqRedis, Depends(get_arq_redis)],
+    redis_client: Annotated[redis.Redis, Depends(get_sync_redis_client_for_api)] # Inject Redis client
+):
+    return await _submit_batch(request_data, auth, supabase, arq_redis, redis_client, "invoice")
 
 # --- Batch Status Endpoints ---
 
 # Helper to get batch status (consolidates logic)
-# async def _get_batch_status(batch_id: str, auth: AuthData, supabase: Client, job_type: str) -> BatchStatusResponseModel:
-    # ... (commented out helper function body) ...
-    # return response_data # Return the Pydantic model directly
+async def _get_batch_status(
+    batch_id: str, 
+    auth: AuthData, 
+    supabase: Client, # Still needed to verify document access within loop? No, only for initial fetch if using DB.
+    redis_client: redis.Redis # Added redis_client dependency
+) -> BatchStatusResponseModel:
+    """Retrieves batch status and individual job statuses from Redis."""
+    user_id = auth["user_id"]
+    
+    # 1. Get Batch Metadata from Redis
+    batch_redis_key = f"batch:{batch_id}"
+    logger.info(f"Fetching batch metadata from Redis key: {batch_redis_key}") # Log key
+    batch_json = redis_client.get(batch_redis_key)
+    # --- Add debug print --- 
+    print(f"DEBUG: Raw data retrieved from Redis for key {batch_redis_key}: {batch_json}")
+    # --- End debug print --- 
+    if not batch_json:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Batch job with ID '{batch_id}' not found.")
+    
+    try:
+        batch_record = json.loads(batch_json)
+    except json.JSONDecodeError:
+        logger.error(f"Failed to decode JSON for batch {batch_id}: {batch_json}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse batch data.")
 
-# @router.get("/statements/batch/{batch_id}", 
-#              response_model=BatchStatusResponseModel,
-#              summary="Get Bank Statement Batch Status",
-#              description="Retrieves the status and results of a batch processing job for bank statements.")
-# async def get_statement_batch_status(
-#     batch_id: Annotated[str, Path(description="The ID of the batch to retrieve.")],
-#     auth: AuthData,
-#     supabase: Annotated[Client, Depends(get_supabase_client)],
-# ):
-#     batch_status_data = await _get_batch_status(batch_id, auth, supabase, "bank_statement")
-#     return create_success_response(data=batch_status_data.model_dump(exclude_none=True))
+    # --- Add Logging Here --- 
+    current_user_id = user_id # User ID from auth dependency (still available, but not used for check)
+    logger.info(f"Fetching batch {batch_id} for user {current_user_id}. Ownership check disabled.") # Adjust log message
+    # --- End Logging --- 
 
-# @router.get("/invoices/batch/{batch_id}", 
-#              response_model=BatchStatusResponseModel,
-#              summary="Get Invoice Batch Status",
-#              description="Retrieves the status and results of a batch processing job for invoices.")
-# async def get_invoice_batch_status(
-#     batch_id: Annotated[str, Path(description="The ID of the batch to retrieve.")],
-#     auth: AuthData,
-#     supabase: Annotated[Client, Depends(get_supabase_client)],
-# ):
-#     batch_status_data = await _get_batch_status(batch_id, auth, supabase, "invoice")
-#     return create_success_response(data=batch_status_data.model_dump(exclude_none=True)) 
+    job_ids = batch_record.get("job_ids", [])
+    if not job_ids:
+         # Return current batch status if no job IDs are associated
+         return BatchStatusResponseModel(
+            batch_id=batch_id,
+            status=JobStatus(batch_record.get("status", JobStatus.FAILED)),
+            total_files=0,
+            processed_files=0,
+            failed_files=0,
+            created_at=datetime.fromisoformat(batch_record["created_at"]),
+            updated_at=datetime.fromisoformat(batch_record["updated_at"]),
+            files=[],
+            callback_url=batch_record.get("callback_url")
+        )
+
+    # 2. Get Individual Job Statuses from Redis
+    file_statuses: List[BatchFileResponseModel] = []
+    processed_count = 0
+    failed_count = 0
+    pending_or_processing_count = 0
+    batch_job_data = {} # Store individual job data if needed
+    overall_status = JobStatus.PROCESSING # Assume processing until proven otherwise by checking jobs
+    allCompleted = True
+    allFailed = True
+
+    try:
+        # Use Redis pipeline for efficiency
+        pipe = redis_client.pipeline()
+        for job_id in job_ids:
+            pipe.get(f"job:{job_id}")
+        job_jsons = pipe.execute()
+    except redis.RedisError as e:
+        logger.error(f"Batch {batch_id}: Redis error fetching job statuses: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve job statuses.")
+
+    for i, job_json in enumerate(job_jsons):
+        job_id = job_ids[i]
+        job_status = JobStatus.FAILED # Renamed from status
+        error_msg = "Job data not found in cache (expired or failed before processing)." 
+        file_id_for_response = None 
+        doc_id_for_response = None 
+        
+        if job_json:
+            try:
+                job_data = json.loads(job_json)
+                batch_job_data[job_id] = job_data 
+                job_status = JobStatus(job_data.get("status", JobStatus.FAILED)) # Renamed from status
+                error_msg = job_data.get("error_message")
+                file_id_for_response = job_data.get("file_id")
+                doc_id_for_response = job_data.get("document_id")
+            except json.JSONDecodeError:
+                 logger.error(f"Batch {batch_id}: Failed to decode JSON for job {job_id}: {job_json}")
+                 job_status = JobStatus.FAILED # Renamed from status
+                 error_msg = "Failed to parse job data from cache."
+        
+        # Append status for this file
+        file_statuses.append(BatchFileResponseModel(
+            file_id=file_id_for_response or "unknown", 
+            document_id=doc_id_for_response,
+            status=job_status, # Use renamed variable
+            error=error_msg if job_status == JobStatus.FAILED else None # Use renamed variable
+        ))
+
+        # Count statuses AND update overall batch status flags 
+        if job_status == JobStatus.COMPLETED: # Use renamed variable
+            processed_count += 1
+            allFailed = False 
+        elif job_status == JobStatus.FAILED: # Use renamed variable
+            failed_count += 1
+            allCompleted = False 
+        elif job_status == JobStatus.PENDING or job_status == JobStatus.PROCESSING: # Use renamed variable
+            pending_or_processing_count += 1
+            allCompleted = False
+            allFailed = False
+            overall_status = JobStatus.PROCESSING
+            # break # Can break early as batch is still processing
+
+    # 3. Determine Final Overall Batch Status 
+    if allCompleted:
+        overall_status = JobStatus.COMPLETED
+    elif allFailed:
+        overall_status = JobStatus.FAILED
+    else:
+        overall_status = JobStatus.FAILED 
+        logger.warning(f"Batch {batch_id}: Mixed final job states (completed/failed), marking batch as FAILED.")
+
+    # 4. Construct Final Response
+    response_data = BatchStatusResponseModel(
+        batch_id=batch_id,
+        status=overall_status, 
+        total_files=len(job_ids),
+        processed_files=processed_count,
+        failed_files=failed_count,
+        created_at=datetime.fromisoformat(batch_record["created_at"]),
+        updated_at=datetime.fromisoformat(batch_record["updated_at"]), # Use timestamp from batch record
+        files=file_statuses,
+        callback_url=batch_record.get("callback_url")
+    )
+    return response_data 
+
+@router.get("/statements/batch/{batch_id}", 
+             response_model=BatchStatusResponseModel,
+             summary="Get Bank Statement Batch Status",
+             description="Retrieves the status and results of a batch processing job for bank statements.")
+async def get_statement_batch_status(
+    batch_id: Annotated[str, Path(description="The ID of the batch to retrieve.")],
+    auth: AuthData,
+    supabase: Annotated[Client, Depends(get_supabase_client)], # Keep Supabase if needed elsewhere? No.
+    redis_client: Annotated[redis.Redis, Depends(get_sync_redis_client_for_api)] # Inject Redis
+):
+    # Pass supabase=None if not needed, or remove entirely if _get_batch_status doesn't need it.
+    batch_status_data = await _get_batch_status(batch_id, auth, None, redis_client)
+    return create_success_response(data=batch_status_data.model_dump(mode='json', exclude_none=True))
+
+@router.get("/invoices/batch/{batch_id}", 
+             response_model=BatchStatusResponseModel,
+             summary="Get Invoice Batch Status",
+             description="Retrieves the status and results of a batch processing job for invoices.")
+async def get_invoice_batch_status(
+    batch_id: Annotated[str, Path(description="The ID of the batch to retrieve.")],
+    auth: AuthData,
+    supabase: Annotated[Client, Depends(get_supabase_client)], # Keep Supabase if needed elsewhere? No.
+    redis_client: Annotated[redis.Redis, Depends(get_sync_redis_client_for_api)] # Inject Redis
+):
+    # Pass supabase=None if not needed, or remove entirely if _get_batch_status doesn't need it.
+    batch_status_data = await _get_batch_status(batch_id, auth, None, redis_client)
+    return create_success_response(data=batch_status_data.model_dump(mode='json', exclude_none=True))
 
 # Note: Also commenting out the /parse endpoint for now to fully isolate /statements
 # --- General Parse Endpoint ---

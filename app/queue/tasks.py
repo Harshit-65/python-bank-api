@@ -135,27 +135,44 @@ async def update_job_status(supabase: Client, job_id: str, status: JobStatus, re
         logger.error(f"Failed to update job {job_id} status in Supabase table 'jobs': {e}")
 
 def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
-    """Extracts a JSON object from a string, handling markdown code blocks."""
+    """Extracts a JSON object from a string, handling markdown code blocks and performing cleaning similar to Go implementation."""
+    json_str = None
     try:
-        # Handle markdown code blocks
+        # Handle markdown code blocks first
         if "```json" in text:
-            text = text.split("```json")[1].split("```")[0]
+            json_str = text.split("```json", 1)[1].split("```", 1)[0]
         elif "```" in text:
-             text = text.split("```")[1].split("```")[0]
+             # Handle generic markdown block if ```json not present
+             json_str = text.split("```", 1)[1].split("```", 1)[0]
         
-        # Find the first '{' and the last '}'
-        start = text.find('{')
-        end = text.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            json_str = text[start:end+1]
-            return json.loads(json_str)
-        else:
-            logger.warning("Could not find JSON object delimiters in text.")
-            return None
+        # Fallback: If no markdown blocks found, find first '{' and last '}' and clean like Go
+        if json_str is None:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                # Slice between braces
+                json_str = text[start:end+1]
+                # Perform cleaning similar to Go's extractJSONFromText
+                # (This was the missing part)
+                # json_str = json_str.replace("```json", "") # Redundant if already sliced
+                # json_str = json_str.replace("```", "")      # Redundant if already sliced
+                json_str = json_str.replace("\\n", " ") # Replace escaped newlines (might be present)
+                json_str = json_str.replace("\n", " ")  # Replace literal newlines
+                json_str = json_str.replace("\r", "")   # Replace carriage returns
+            else:
+                # If no braces found either, return None
+                logger.warning("Could not find JSON object delimiters or markdown blocks in text.")
+                return None
+        
+        # Trim whitespace from the result before parsing
+        json_str = json_str.strip()
+
+        # Attempt to parse the extracted/cleaned string
+        return json.loads(json_str) 
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode JSON: {e}\nRaw text: {text[:500]}...")
+        logger.error(f"Failed to decode JSON: {e}\\nAttempted JSON string: {json_str[:500]}...\\nOriginal text: {text[:500]}...")
         return None
-    except Exception as e:
+    except Exception as e: # Catch index errors from split etc.
         logger.error(f"Unexpected error extracting JSON: {e}")
         return None
 

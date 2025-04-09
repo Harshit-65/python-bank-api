@@ -16,7 +16,7 @@ async def check_db_health(supabase: Client = Depends(get_supabase_client)) -> He
     try:
         # Simple check: Try to fetch a single item from a known small table or schema info
         # Adjust table/query as needed for your Supabase setup
-        await supabase.table("api_keys").select("id").limit(1).execute()
+        supabase.table("api_keys").select("id").limit(1).execute()
         return HealthStatusModel(status=True)
     except Exception as e:
         print(f"Database health check failed: {e}")
