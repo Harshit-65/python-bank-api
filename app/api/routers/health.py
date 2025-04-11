@@ -33,9 +33,5 @@ async def health_check(db_health: HealthStatusModel = Depends(check_db_health)) 
         timestamp=datetime.now(timezone.utc),
         services=services_health
     )
-    # Although we define response_model, FastAPI doesn't automatically wrap it
-    # in our {success: true, data: ...} structure. So we return the model directly.
-    # If we wanted the wrapper, we'd use `create_success_response(data=health_data)`
-    # but then the response_model in the decorator might be slightly misleading.
-    # For health checks, returning the direct model is common.
+
     return health_data 
