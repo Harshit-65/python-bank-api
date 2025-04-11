@@ -11,7 +11,7 @@ from app.config import RedisSettings as AppRedisSettings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
+logging.getLogger('arq.worker').setLevel(logging.WARNING)
 # Create ARQ RedisSettings object from loaded config values
 arq_redis_settings = ArqRedisSettings(
     host=AppRedisSettings.redis_url.split("://")[1].split(":")[0],

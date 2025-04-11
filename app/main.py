@@ -42,6 +42,6 @@ app.include_router(health.router, prefix=API_PREFIX, tags=["Health"])
 app.include_router(upload.router, prefix=API_PREFIX + "/parse", tags=["Upload"])
 app.include_router(jobs.router, prefix=API_PREFIX + "/parse", tags=["Parsing Jobs"])
 
-@app.get("/", include_in_schema=False)
-async def root():
-    return {"message": "Welcome to the Python Bank API"}
+# @app.get("/", include_in_schema=False)
+# async def root():
+#     return {"message": "Welcome to the Python Bank API"}

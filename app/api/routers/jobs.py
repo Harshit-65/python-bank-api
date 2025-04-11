@@ -236,8 +236,16 @@ async def get_statement_job_status(
 
         job_data = json.loads(job_json)
         
+        # --- ADD DEBUG LOGGING ---
+        user_id_from_auth = auth["user_id"]
+        user_id_from_redis = job_data.get("user_id")
+        logger.info(f"Job {job_id}: Ownership Check - User from Auth: {user_id_from_auth}, User from Redis: {user_id_from_redis}")
+        logger.debug(f"Job {job_id}: Full job_data from Redis: {json.dumps(job_data)}") # Log full data as JSON string
+        # --- END DEBUG LOGGING ---
+        
         # Optional: Verify ownership (important if user_id is part of job_data in Redis)
-        if job_data.get("user_id") != user_id:
+        if user_id_from_redis != user_id_from_auth: # Compare fetched values explicitly
+             logger.error(f"Job {job_id}: Access Denied. Auth User '{user_id_from_auth}' != Redis User '{user_id_from_redis}'")
              raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied to this job.")
 
         # Parse results (already parsed in job_data if stored correctly)
@@ -261,6 +269,9 @@ async def get_statement_job_status(
         # Use mode='json' to handle datetime serialization
         return create_success_response(data=response_data.model_dump(mode='json', exclude_none=True))
 
+    except HTTPException as http_exc:
+        # Re-raise HTTPException explicitly to prevent it being caught by the generic Exception block
+        raise http_exc
     except json.JSONDecodeError:
          logger.error(f"Job {job_id}: Failed to decode job JSON from Redis: {job_json}")
          raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse job data.")
