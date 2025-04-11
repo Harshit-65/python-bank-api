@@ -12,7 +12,7 @@ from supabase._sync.client import SyncStorageClient # Updated import path
 # Import the helper function and specific exceptions, not AuthData type alias
 from ...auth.dependencies import _perform_key_verification, oauth2_scheme, APIKeyNotFound, KeyfolioVerificationError, InvalidTokenError, RateLimitExceededError
 from ...db.supabase_client import get_supabase_client
-from ..models.requests import ALLOWED_EXTENSIONS, MAX_FILES, MAX_FILE_SIZE_BYTES
+from ..models.requests import ALLOWED_EXTENSIONS, MAX_FILES, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
 from ..models.responses import UploadResponseModel, UploadedFileModel
 from ..utils.response_utils import create_success_response
 # Import PyMuPDF (fitz) - make sure it's in requirements.txt
@@ -401,16 +401,18 @@ async def handle_upload(
              print(f"[Upload] Closed file: {file.filename}")
 
 
+        # --- Append Result Inside Loop --- (MOVED)
         uploaded_files_data.append(
              UploadedFileModel(
-                 file_id=unique_filename, # Use the unique filename as file_id for response
-                 doc_id=doc_id, # Include the generated document ID
-                 file_url=file_url, # Now includes the public URL
+                 file_id=unique_filename if not upload_error and unique_filename else file.filename, # Use unique ID on success, else original name
+                 doc_id=doc_id, 
+                 file_url=file_url, 
                  error=upload_error,
-                 type=determined_doc_type # Include the determined type
+                 type=determined_doc_type 
              )
          )
-        print(f"[Upload] Added file to response data: {file.filename}, doc_id: {doc_id}, type: {determined_doc_type}, url: {file_url}")
+        print(f"[Upload] Appended result for: {file.filename}") # DEBUG
+        # --- End Append Result --- 
 
     # Return standardized success response
     response_data = UploadResponseModel(files=uploaded_files_data, status=overall_status)

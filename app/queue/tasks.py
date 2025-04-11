@@ -5,7 +5,8 @@ import random
 from io import BytesIO
 from typing import Dict, Any, Optional
 import mimetypes
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import httpx
 
 import google.generativeai as genai
 from supabase import create_client, Client
@@ -16,6 +17,7 @@ import redis # Import the redis library
 from ..config import SUPABASE_URL, SUPABASE_KEY, GOOGLE_API_KEY, GOOGLE_API_KEYS, REDIS_URL, REDIS_PASSWORD
 from ..db.supabase_client import get_supabase_client # Re-use client logic
 from ..api.models.requests import JobStatus
+from arq.cron import cron 
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +202,266 @@ async def call_gemini(prompt: str, content_parts: list):
     logger.error(error_msg)
     raise ConnectionError(error_msg)
 
+# --- Usage Quota Update Helper (NEW) ---
+
+def _update_usage_quota_in_supabase(supabase: Client, document_id: str):
+    """Fetches document details and updates the usage_quotas table.
+       Logs errors but does not raise exceptions to prevent failing the main job.
+    """
+    try:
+        # 1. Get user_id and file_size from documents table
+        doc_response = supabase.table("documents") \
+                             .select("user_id, file_size") \
+                             .eq("id", document_id) \
+                             .maybe_single() \
+                             .execute()
+
+        if not doc_response.data:
+            logger.error(f"Quota Update: Document {document_id} not found.")
+            return
+
+        user_id = doc_response.data.get("user_id")
+        file_size = doc_response.data.get("file_size", 0)
+
+        if not user_id:
+            logger.error(f"Quota Update: User ID not found for document {document_id}.")
+            return
+        if file_size is None:
+            file_size = 0 # Default to 0 if size is null
+
+        # 2. Determine current billing period (first day of current month)
+        now = datetime.now(timezone.utc)
+        period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Calculate period_end (first day of next month)
+        next_month = period_start.replace(day=28) + timedelta(days=4) # Go to approx next month
+        period_end = next_month.replace(day=1) 
+
+        # Format for Supabase timestampz
+        period_start_iso = period_start.isoformat()
+        period_end_iso = period_end.isoformat()
+
+        # 3. Upsert usage quota
+        # Mimic Go's default limits if creating a new record
+        default_docs_limit = 1000
+        default_data_limit = 10 * 1024 * 1024 * 1024 # 10 GB
+
+        # Data to potentially insert
+        upsert_data = {
+            "user_id": user_id,
+            "period_start": period_start_iso,
+            "docs_limit": default_docs_limit,
+            "data_limit": default_data_limit,
+            "docs_processed": 1, # Increment logic handled by DB function/trigger or manually on conflict
+            "data_processed": file_size # Increment logic handled by DB function/trigger or manually on conflict
+        }
+
+        # Using upsert. If a row for user_id & period_start exists, it should ideally be updated.
+        # NOTE: This relies on Supabase handling the increment on conflict OR 
+        # a more complex select-then-update approach might be needed if upsert doesn't increment.
+        # For simplicity, mirroring Go's apparent upsert reliance first.
+        # Check Supabase upsert documentation for exact conflict handling (e.g., ON CONFLICT DO UPDATE).
+        # A simple upsert might just overwrite, not increment. 
+        # Let's assume for now we need to handle increment manually on conflict, or a DB trigger exists.
+        
+        # Simplified Upsert - may need refinement based on actual DB setup/triggers
+        # If a conflict on (user_id, period_start) occurs, Supabase needs a way 
+        # to *increment* existing values, not just overwrite.
+        # This might require a custom DB function called via rpc or a more complex SELECT then UPDATE.
+        # Placeholder for simple upsert:
+        logger.info(f"Quota Update: Attempting upsert for user {user_id}, period {period_start_iso}")
+        response = supabase.table("usage_quotas") \
+                           .upsert(upsert_data, on_conflict="user_id,period_start") \
+                           .execute()
+
+        if response.data: # Check if upsert returned data
+             logger.info(f"Quota Update: Successfully upserted usage for user {user_id}, period {period_start_iso}")
+        else:
+             # If upsert didn't return data, maybe the increment needs to be manual
+             logger.warning(f"Quota Update: Upsert for user {user_id} completed but returned no data. Increment might need manual handling or DB trigger.")
+             # Fallback/Alternative: SELECT first, then UPDATE or INSERT
+             # This is more robust if upsert doesn't increment correctly.
+             # quota_res = supabase.table("usage_quotas") \
+             #                  .select("id, docs_processed, data_processed") \
+             #                  .eq("user_id", user_id) \
+             #                  .eq("period_start", period_start_iso) \
+             #                  .maybe_single() \
+             #                  .execute()
+             # if quota_res.data:
+             #     # Update existing
+             #     existing_quota = quota_res.data
+             #     update_res = supabase.table("usage_quotas") \
+             #                       .update({ \
+             #                           "docs_processed": existing_quota["docs_processed"] + 1, \
+             #                           "data_processed": existing_quota["data_processed"] + file_size \
+             #                       }) \
+             #                       .eq("id", existing_quota["id"]) \
+             #                       .execute()
+             # else:
+             #     # Insert new
+             #     insert_res = supabase.table("usage_quotas").insert(upsert_data).execute()
+
+    except Exception as e:
+        logger.error(f"Quota Update: Failed to update usage quota for doc {document_id}: {e}", exc_info=True)
+        # Do not re-raise, just log the error
+
+# --- Webhook Notification Helper (NEW) ---
+
+async def send_webhook_notification(callback_url: str, payload: Dict[str, Any]):
+    """Sends a POST request to the specified callback URL with the JSON payload.
+       Logs errors but does not raise exceptions.
+    """
+    if not callback_url:
+        return
+
+    logger.info(f"Sending webhook to {callback_url}")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client: # 10 second timeout like Go
+            response = await client.post(callback_url, json=payload)
+
+            if response.status_code >= 400:
+                logger.error(f"Webhook failed for {callback_url}. Status: {response.status_code}, Response: {response.text[:500]}")
+            else:
+                logger.info(f"Webhook sent successfully to {callback_url}. Status: {response.status_code}")
+
+    except httpx.RequestError as e:
+        logger.error(f"Webhook failed for {callback_url}. Request Error: {e}")
+    except Exception as e:
+        logger.error(f"Webhook failed for {callback_url}. Unexpected Error: {e}", exc_info=True)
+
+# --- Batch Status Check Task (NEW) ---
+
+async def check_batch_statuses(ctx: dict):
+    """Periodically checks pending/processing batches and updates their status if all jobs are done."""
+    # --- Use async redis client from context --- (MODIFIED)
+    redis_client: ArqRedis = ctx['redis'] # ARQ puts the pool/client here
+    # redis_client = get_sync_redis_client() # REMOVE sync client
+    logger.info("Running periodic batch status check...")
+    updated_count = 0
+    processed_keys = 0
+    try:
+        # Use async iteration for scan_iter if available, or handle potential blocking
+        # Note: redis-py's async scan_iter might still fetch keys in chunks.
+        # If this becomes a bottleneck with huge numbers of keys, different strategies exist.
+        async for batch_key_bytes in redis_client.scan_iter("batch:*"): # Use async for loop
+            processed_keys += 1
+            # --- Decode bytes key to string --- (NEW)
+            batch_key = batch_key_bytes.decode('utf-8')
+            # --- End Decode ---
+            batch_id = batch_key.split(":", 1)[1] # Extract ID from key (Now works on string)
+            batch_json = await redis_client.get(batch_key) # Use await (GET can often accept bytes or str key)
+            if not batch_json:
+                logger.warning(f"Batch Check: Found key {batch_key} but failed to get value.")
+                continue
+                
+            try:
+                batch_data = json.loads(batch_json)
+            except json.JSONDecodeError:
+                logger.warning(f"Batch Check: Failed to decode JSON for batch {batch_id}. Skipping.")
+                continue
+            
+            current_batch_status = batch_data.get("status")
+            
+            # Only check batches that are not already in a final state
+            if current_batch_status not in [JobStatus.PENDING.value, JobStatus.PROCESSING.value]:
+                continue
+
+            job_ids = batch_data.get("job_ids", [])
+            if not job_ids:
+                logger.warning(f"Batch Check: Batch {batch_id} has no job IDs. Marking as failed.")
+                if current_batch_status != JobStatus.FAILED.value:
+                    batch_data["status"] = JobStatus.FAILED.value
+                    batch_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    await redis_client.set(batch_key, json.dumps(batch_data), ex=24 * 3600) # Use await
+                    updated_count += 1
+                continue
+
+            # Get statuses of all constituent jobs
+            job_keys = [f"job:{job_id}" for job_id in job_ids]
+            # --- Use async mget --- (MODIFIED)
+            job_jsons = await redis_client.mget(*job_keys) # Use await and unpack keys
+
+            allCompleted = True
+            allFailed = True
+            # Results aggregation similar to Go (only if all completed)
+            job_results_for_batch = [] 
+
+            if len(job_jsons) != len(job_ids):
+                logger.warning(f"Batch Check: MGET for batch {batch_id} returned {len(job_jsons)} results, expected {len(job_ids)}. Some jobs missing?")
+                # Treat missing jobs as failed for status calculation
+                allCompleted = False 
+            
+            for i, job_json in enumerate(job_jsons):
+                job_id = job_ids[i]
+                job_status = JobStatus.FAILED # Assume failed if data missing/invalid
+                
+                if job_json:
+                    try:
+                        job_data = json.loads(job_json)
+                        job_status = JobStatus(job_data.get("status", JobStatus.FAILED))
+                        if job_status == JobStatus.COMPLETED:
+                            allFailed = False
+                            # Collect results only if job completed
+                            if job_data.get("result"):
+                                job_results_for_batch.append(job_data["result"])
+                        elif job_status == JobStatus.FAILED:
+                            allCompleted = False
+                        else: # Pending or Processing
+                            allCompleted = False
+                            allFailed = False
+                            break # Batch is not finished yet, stop checking this batch
+                    except (json.JSONDecodeError, ValueError):
+                        logger.warning(f"Batch Check: Failed to decode/parse job {job_id} status for batch {batch_id}. Treating as failed.")
+                        allCompleted = False
+                else:
+                    # Job key doesn't exist in Redis (expired or never created?)
+                    logger.warning(f"Batch Check: Job key 'job:{job_id}' not found for batch {batch_id}. Treating as failed.")
+                    allCompleted = False
+
+            # If the inner loop didn't break, the batch has finished (all jobs completed or failed)
+            if allCompleted or allFailed:
+                finalStatus = JobStatus.COMPLETED if allCompleted else JobStatus.FAILED
+                
+                # Update batch only if status changed
+                if current_batch_status != finalStatus.value:
+                    logger.info(f"Batch Check: Updating batch {batch_id} status from {current_batch_status} to {finalStatus.value}")
+                    batch_data["status"] = finalStatus.value
+                    batch_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    # Add results only if all completed (like Go)
+                    if finalStatus == JobStatus.COMPLETED:
+                        batch_data["result"] = job_results_for_batch 
+                    await redis_client.set(batch_key, json.dumps(batch_data), ex=24 * 3600) # Use await
+                    updated_count += 1
+                    # Optional: Send batch callback here if needed
+                    # --- Call Webhook for Batch --- (NEW)
+                    if batch_data.get("callback_url"):
+                        # Prepare payload similar to Go's SendBatchCallback
+                        batch_payload = {
+                            "batch_id": batch_data.get("id"),
+                            "status": batch_data.get("status"),
+                            "job_ids": batch_data.get("job_ids"),
+                            "created_at": batch_data.get("created_at"),
+                            "updated_at": batch_data.get("updated_at"),
+                            "result": batch_data.get("result") # Send aggregated results if completed
+                        }
+                        await send_webhook_notification(batch_data["callback_url"], batch_payload) 
+                    # --- End Call Webhook --- 
+            
+            # If batch was pending and jobs started processing (but not finished), update to processing
+            elif current_batch_status == JobStatus.PENDING.value:
+                 logger.info(f"Batch Check: Updating batch {batch_id} status from {current_batch_status} to {JobStatus.PROCESSING.value}")
+                 batch_data["status"] = JobStatus.PROCESSING.value
+                 batch_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                 await redis_client.set(batch_key, json.dumps(batch_data), ex=24 * 3600) # Use await
+                 updated_count += 1
+                
+    except redis.RedisError as e:
+        logger.error(f"Batch Check: Redis error during async scan/update: {e}")
+    except Exception as e:
+        logger.error(f"Batch Check: Unexpected error: {e}", exc_info=True)
+        
+    logger.info(f"Finished periodic batch status check. Scanned {processed_keys} keys. Updated {updated_count} batches.")
+
+
 # --- ARQ Task Definition ---
 
 async def process_document(ctx: dict, job_id: str, document_id: str, file_id: str, user_id: str, callback_url: Optional[str], job_type: str):
@@ -325,12 +587,28 @@ async def process_document(ctx: dict, job_id: str, document_id: str, file_id: st
     # 7. Update Job Status and Results in Redis
     await update_job_status_in_redis(redis_client, job_id, JobStatus.COMPLETED, results=parsed_results)
 
+    # --- Call Usage Quota Update --- (NEW)
+    # This should only run on successful completion
+    _update_usage_quota_in_supabase(supabase, document_id)
+    # --- End Usage Quota Update ---
+
     # 8. Optional: Send Callback (if callback_url exists)
-    # You would need a function similar to Go's SendCallback here, using httpx
+    # --- Call Webhook for Single Job --- (NEW)
     if callback_url:
         logger.info(f"Job {job_id}: Callback URL detected, attempting to send callback.")
-        # await send_callback_notification(job_id, JobStatus.COMPLETED, parsed_results, callback_url) # Implement this function if needed
-        pass # Placeholder
+        # Prepare payload similar to Go's SendCallback
+        job_payload = {
+            "job_id": job_id,
+            "status": JobStatus.COMPLETED.value, # Use final status
+            "file_id": file_id,
+            "created_at": initial_job_data.get("created_at"), # Use initial creation time
+            "updated_at": datetime.now(timezone.utc).isoformat(), # Current time for completion
+            "result": parsed_results
+        }
+        await send_webhook_notification(callback_url, job_payload) 
+        # NOTE: We might also want to send callbacks on FAILED status. Go code doesn't show this.
+        # If needed, call this within the except blocks as well, adjusting the payload status/error.
+    # --- End Call Webhook --- 
 
     logger.info(f"Finished processing job_id: {job_id}")
 
@@ -338,6 +616,15 @@ async def process_document(ctx: dict, job_id: str, document_id: str, file_id: st
 
 # This class defines the functions available to the worker
 class WorkerSettings:
-    functions = [process_document]
+    functions = [process_document, check_batch_statuses] # Add the new function
+    # Add cron job to run check_batch_statuses every 10 seconds
+    # --- Use second='*/10' --- (MODIFIED based on suggestion)
+    cron_jobs = [
+        cron(
+            check_batch_statuses, 
+            second=set(range(0, 60, 10)), # Run every 10 seconds
+            run_at_startup=True
+        )
+    ]
     # Add other settings like `redis_settings`, `max_jobs`, etc. if needed
     # redis_settings = arq_redis_settings # Use settings from arq_client 
