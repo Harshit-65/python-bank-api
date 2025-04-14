@@ -16,6 +16,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from typing import Dict, Any, Optional, List, Tuple
+import uuid
 
 # Third-party imports
 import google.generativeai as genai
@@ -24,7 +25,10 @@ import redis
 from arq import ArqRedis, cron
 from arq.connections import RedisSettings as ArqRedisSettings
 from PIL import Image
-from supabase import create_client, Client
+# --- Use AsyncClient --- 
+from supabase import create_async_client, AsyncClient 
+# --- Remove sync Client import --- 
+# from supabase import create_client, Client 
 import fitz  # PyMuPDF
 
 # Local imports
@@ -37,9 +41,12 @@ from ..config import (
     REDIS_PASSWORD,
     RedisSettings as AppRedisSettings
 )
-from ..db.supabase_client import get_supabase_client
+# --- REMOVE get_supabase_client import from db, we create locally for now ---
+# from ..db.supabase_client import get_supabase_client 
 from ..api.models.requests import JobStatus
 import time
+from ..utils.schema import get_schema, SchemaNotFoundError, DatabaseOperationError # get_schema expects AsyncClient
+
 logger = logging.getLogger(__name__)
 
 # Configure Google AI client with the first key
@@ -55,9 +62,9 @@ else:
 PAGE_RESULT_EXPIRY = 24 * 3600 # Expiry for temporary page results (seconds)
 PAGE_COUNTER_EXPIRY = 24 * 3600 # Expiry for page counters
 
-# --- Prompts (Similar to Go version) ---
+# --- Prompt Constants (Moved here for use in process_page) ---
 
-BANK_STATEMENT_PROMPT = """
+DEFAULT_PROMPT_STATEMENT = """
 Analyze the provided bank statement page image/text. Extract the following information in JSON format:
 - account_number: (string)
 - bank_name: (string)
@@ -71,7 +78,7 @@ Analyze the provided bank statement page image/text. Extract the following infor
 Return ONLY the JSON object. If the page contains no relevant information (e.g., blank page, cover page), return an empty JSON object {{}}.
 """
 
-INVOICE_PROMPT = """
+DEFAULT_PROMPT_INVOICE = """
 Analyze the provided invoice image/text. Extract the following information in JSON format:
 - invoice_number: (string)
 - invoice_date: (string, YYYY-MM-DD)
@@ -92,6 +99,39 @@ Analyze the provided invoice image/text. Extract the following information in JS
 Return ONLY the JSON object. If the page contains no relevant information, return an empty JSON object {{}}.
 """
 
+SCHEMA_PROMPT_TEMPLATE_INVOICE = """You are a precise invoice data extractor. Your task is to extract information from this invoice and format it EXACTLY according to the schema below. You MUST:
+
+1. Follow the schema structure EXACTLY - do not add or modify any fields
+2. Only include fields that are in the schema
+3. Use empty values for fields not found (empty string for strings, 0 for numbers, empty arrays for arrays)
+4. Do not add any fields that are not in the schema
+5. Maintain the exact same field names as in the schema
+
+SCHEMA:
+%s
+
+IMPORTANT: Your response must be EXACTLY in this format. Do not include ANY fields that are not in the schema, even if you find them in the invoice. Do not include any explanations or additional text - ONLY output the JSON that matches the schema structure.
+
+Do not use this schema as just an example - this is the REQUIRED format that your response must follow. Your entire response should be valid JSON that can be parsed directly."""
+
+SCHEMA_PROMPT_TEMPLATE_STATEMENT = """You are a precise bank statement data extractor. Your task is to extract information from this statement page and format it EXACTLY according to the schema below. You MUST:
+
+1. Follow the schema structure EXACTLY - do not add or modify any fields
+2. Only include fields that are in the schema
+3. Use empty values for fields not found (empty string for strings, 0 for numbers, empty arrays for arrays)
+4. Do not add any fields that are not in the schema
+5. Maintain the exact same field names as in the schema
+
+SCHEMA:
+%s
+
+IMPORTANT: Your response must be EXACTLY in this format. Do not include ANY fields that are not in the schema, even if you find them in the statement. Do not include any explanations or additional text - ONLY output the JSON that matches the schema structure.
+
+Do not use this schema as just an example - this is the REQUIRED format that your response must follow. Your entire response should be valid JSON that can be parsed directly."""
+
+# --- End Prompt Constants ---
+
+
 # --- Helper Functions ---
 # --- NEW Task: Process a Single Page ---
 async def process_page(
@@ -101,33 +141,74 @@ async def process_page(
     file_id: str, # Pass file_id for webhook later
     user_id: str, # Pass user_id for potential future use
     job_type: str,
+    schema_id: Optional[str], # <-- Add schema_id parameter
     page_num: int, # 0-indexed page number
     total_pages: int,
     page_image_bytes: bytes
     ):
     """Processes a single page image using Gemini."""
     redis_client = await get_arq_redis_from_ctx(ctx)
+    # --- Get AsyncClient (create directly for now) --- 
+    supabase_client: AsyncClient = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
     page_start_time = time.time() # Start timer for page processing
-    logger.info(f"Job {job_id}: Starting processing for page {page_num + 1}/{total_pages}")
+    logger.info(f"Job {job_id}: Starting processing for page {page_num + 1}/{total_pages}, Schema: {schema_id or 'default'}")
 
     page_result_key = f"page_result:{job_id}:{page_num}"
     page_result_data = {"page_num": page_num + 1, "success": False, "error": None, "data": None}
     ai_response_text = None # Store raw response
+    schema_string = None # Store fetched schema string
 
     try:
-        # 1. Prepare prompt and content parts
-        prompt = BANK_STATEMENT_PROMPT if job_type == 'bank_statement' else INVOICE_PROMPT
-        # Assuming page_image_bytes is PNG format based on previous logic
-        content_parts = [{"mime_type": "image/png", "data": page_image_bytes}]
+        # --- 1. Fetch Schema String (if schema_id provided) ---
+        if schema_id:
+            try:
+                # Convert schema_id string to UUID
+                schema_uuid = uuid.UUID(schema_id)
+                # Fetch schema using the utility function (requires user_id)
+                # We need the user_id as a UUID for the get_schema function
+                user_uuid = uuid.UUID(user_id)
+                # --- Pass the async client to get_schema --- 
+                schema_db = await get_schema(supabase_client, schema_uuid, user_uuid)
 
-        # 2. Call Gemini
+                # --- Check Schema Type Mismatch --- 
+                if schema_db.type.value != job_type:
+                    logger.warning(f"Job {job_id}, Page {page_num + 1}: Schema type '{schema_db.type.value}' mismatches job type '{job_type}'. Using default prompt.")
+                    schema_string = None # Force use of default prompt
+                else:
+                    schema_string = schema_db.schema_string
+                    logger.info(f"Job {job_id}, Page {page_num + 1}: Using custom schema ID {schema_id} of type {schema_db.type.value}")
+                # --- End Check ---
+                
+            except (SchemaNotFoundError, DatabaseOperationError, ValueError) as schema_err:
+                logger.warning(f"Job {job_id}, Page {page_num + 1}: Failed to fetch/validate schema ID {schema_id}: {schema_err}. Using default prompt.")
+                schema_string = None # Fallback to default
+            except Exception as e:
+                logger.error(f"Job {job_id}, Page {page_num + 1}: Unexpected error fetching schema {schema_id}: {e}. Using default prompt.", exc_info=True)
+                schema_string = None
+        # --- End Fetch Schema ---
+
+        # --- 2. Prepare Prompt and Content --- 
+        prompt = "" # Initialize prompt
+        if schema_string:
+            # Use the schema-specific prompt template
+            prompt_template = SCHEMA_PROMPT_TEMPLATE_INVOICE if job_type == "invoice" else SCHEMA_PROMPT_TEMPLATE_STATEMENT
+            prompt = prompt_template % schema_string
+        else:
+            # Use the default prompt
+            prompt = DEFAULT_PROMPT_INVOICE if job_type == "invoice" else DEFAULT_PROMPT_STATEMENT
+
+        # Prepare content parts (image)
+        content_parts = [{"mime_type": "image/png", "data": page_image_bytes}]
+        # --- End Prepare Prompt ---
+
+        # 3. Call Gemini
         gemini_start_time = time.time()
         ai_response_text = await call_gemini(prompt, content_parts)
         gemini_duration = time.time() - gemini_start_time
         logger.info(f"Job {job_id}, Page {page_num + 1}: Received Gemini response in {gemini_duration:.2f}s.")
         logger.debug(f"Job {job_id}, Page {page_num + 1}: Raw Gemini Response:\n{ai_response_text}") # Log raw response
 
-        # 3. Parse Response
+        # 4. Parse Response
         parsing_start_time = time.time()
         parsed_data = extract_json_from_text(ai_response_text) # extract_json now logs failures
         parsing_duration = time.time() - parsing_start_time
@@ -196,25 +277,19 @@ async def process_page(
         if completed_count >= total_pages:
             logger.info(f"Job {job_id}: All pages reported completion. Enqueuing assembly task.")
             await redis_client.enqueue_job(
-                "assemble_job_results", # Function name for the assembly task
-                _job_id=f"asm_{job_id}", # Unique job ID for assembly task itself
+                "assemble_job_results",
+                _job_id=f"asm_{job_id}",
                 job_id=job_id,
                 document_id=document_id,
                 file_id=file_id,
                 user_id=user_id,
                 job_type=job_type,
+                schema_id=schema_id, # <-- Pass schema_id
                 total_pages=total_pages
             )
     except Exception as e:
         logger.error(f"Job {job_id}, Page {page_num + 1}: Failed to increment/check page counter or enqueue assembly: {e}", exc_info=True)
 
-
-def get_sync_supabase_client() -> Client:
-    """Creates a synchronous Supabase client for worker tasks."""
-    # Workers might run in separate processes, simpler to create sync client
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError("Supabase URL/Key missing for worker")
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def get_sync_redis_client() -> redis.Redis:
     """Creates a synchronous Redis client for worker tasks."""
@@ -255,6 +330,7 @@ async def update_job_status_in_redis(
     document_id_for_stub: Optional[str] = None,
     file_id_for_stub: Optional[str] = None,
     job_type_for_stub: Optional[str] = None,
+    schema_id_for_stub: Optional[str] = None,
     created_at_for_stub: Optional[str] = None
     # --- END NEW ---
     ):
@@ -306,6 +382,7 @@ async def update_job_status_in_redis(
                      "document_id": document_id_for_stub, 
                      "file_id": file_id_for_stub,
                      "job_type": job_type_for_stub,
+                     "schema_id": schema_id_for_stub,
                      "created_at": created_at_for_stub or datetime.now(timezone.utc).isoformat()
                  }
                  missing_stub_fields = [k for k, v in job_data.items() if v is None and k.endswith('_id')]
@@ -367,6 +444,8 @@ async def update_job_status_in_redis(
             job_data["file_id"] = file_id_for_stub
         if job_type_for_stub:
              job_data["job_type"] = job_type_for_stub
+        if schema_id_for_stub:
+             job_data["schema_id"] = schema_id_for_stub
         if created_at_for_stub: # Especially important for stubs
              job_data["created_at"] = job_data.get("created_at", created_at_for_stub) # Preserve existing if possible, else use stub
         # --- END MODIFIED ---
@@ -550,7 +629,7 @@ async def send_webhook_notification(callback_url: str, payload: Dict[str, Any]):
 
 # --- Supabase update function (keep for now, might be needed elsewhere or if pattern changes) ---
 # This function is NO LONGER USED by process_document for status updates.
-async def update_job_status(supabase: Client, job_id: str, status: JobStatus, results: Optional[Dict[str, Any]] = None, error_message: Optional[str] = None):
+async def update_job_status(supabase: AsyncClient, job_id: str, status: JobStatus, results: Optional[Dict[str, Any]] = None, error_message: Optional[str] = None):
     """Updates job status and optionally results/error in Supabase."""
     update_data = {"status": status.value, "updated_at": datetime.now(timezone.utc).isoformat()}
     if results is not None:
@@ -630,15 +709,12 @@ async def call_gemini(prompt: str, content_parts: list):
     logger.error(error_msg)
     raise ConnectionError(error_msg)
 
-# --- Usage Quota Update Helper (NEW - Copied from provided code) ---
-
-def _update_usage_quota_in_supabase(supabase: Client, document_id: str):
-    """Fetches document details and updates the usage_quotas table.
-       Logs errors but does not raise exceptions to prevent failing the main job.
-    """
+# --- Usage Quota Update Helper (REFACTORED to ASYNC) --- 
+async def update_usage_quota_in_supabase_async(supabase: AsyncClient, document_id: str):
+    """Fetches document details and updates the usage_quotas table (Async version)."""
     try:
-        # 1. Get user_id and file_size from documents table
-        doc_response = supabase.table("documents") \
+        # 1. Get user_id and file_size - USE AWAIT
+        doc_response = await supabase.table("documents") \
                              .select("user_id, file_size") \
                              .eq("id", document_id) \
                              .maybe_single() \
@@ -655,49 +731,40 @@ def _update_usage_quota_in_supabase(supabase: Client, document_id: str):
             logger.error(f"Quota Update: User ID not found for document {document_id}.")
             return
         if file_size is None:
-            file_size = 0 # Default to 0 if size is null
+            file_size = 0
 
-        # 2. Determine current billing period (first day of current month)
+        # 2. Determine current billing period
         now = datetime.now(timezone.utc)
         period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        # Calculate period_end (first day of next month)
-        next_month = period_start.replace(day=28) + timedelta(days=4) # Go to approx next month
-        period_end = next_month.replace(day=1) 
-
         # Format for Supabase timestampz
         period_start_iso = period_start.isoformat()
-        period_end_iso = period_end.isoformat()
 
-        # 3. Upsert usage quota
-        # Mimic Go's default limits if creating a new record
+        # 3. Upsert usage quota - USE AWAIT
         default_docs_limit = 1000
-        default_data_limit = 10 * 1024 * 1024 * 1024 # 10 GB
-
-        # Data to potentially insert
+        default_data_limit = 10 * 1024 * 1024 * 1024 
         upsert_data = {
             "user_id": user_id,
             "period_start": period_start_iso,
             "docs_limit": default_docs_limit,
             "data_limit": default_data_limit,
-            "docs_processed": 1, # Increment logic handled by DB function/trigger or manually on conflict
-            "data_processed": file_size # Increment logic handled by DB function/trigger or manually on conflict
+            "docs_processed": 1,
+            "data_processed": file_size
         }
         
-        # Simplified Upsert - assumes DB trigger/function handles increment on conflict
         logger.info(f"Quota Update: Attempting upsert for user {user_id}, period {period_start_iso}")
-        response = supabase.table("usage_quotas") \
+        # --- Use AWAIT --- 
+        response = await supabase.table("usage_quotas") \
                            .upsert(upsert_data, on_conflict="user_id,period_start") \
                            .execute()
 
-        if response.data: # Check if upsert returned data
+        if response.data: 
              logger.info(f"Quota Update: Successfully upserted usage for user {user_id}, period {period_start_iso}")
         else:
-             logger.warning(f"Quota Update: Upsert for user {user_id} completed but returned no data. Increment might need manual handling or DB trigger.")
+             logger.warning(f"Quota Update: Upsert for user {user_id} completed but returned no data. Check DB triggers/functions for increment logic.")
 
     except Exception as e:
         logger.error(f"Quota Update: Failed to update usage quota for doc {document_id}: {e}", exc_info=True)
-        # Do not re-raise, just log the error
-
+# --- End Refactored Quota Function ---
 
 # --- Batch Status Check Task (MODIFIED for async redis) ---
 
@@ -856,12 +923,14 @@ async def assemble_job_results(
     file_id: str,
     user_id: str,
     job_type: str,
+    schema_id: Optional[str], # <-- Add schema_id parameter
     total_pages: int
     ):
     """Gathers page results, merges them, cleans data, updates final job status."""
     redis_client = await get_arq_redis_from_ctx(ctx)
-    supabase_client = get_sync_supabase_client() # Needed for quota update
-    logger.info(f"Job {job_id}: Starting assembly of {total_pages} pages.")
+    # --- Get AsyncClient (create directly for now) --- 
+    supabase_client: AsyncClient = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.info(f"Job {job_id}: Starting assembly of {total_pages} pages. Schema: {schema_id or 'default'}")
 
     all_page_results = []
     page_keys = [f"page_result:{job_id}:{i}" for i in range(total_pages)]
@@ -871,28 +940,28 @@ async def assemble_job_results(
     error_message = None
 
     # -- Initialize variables needed for potential stub creation --
-    # Use values passed into the task as defaults
     user_id_for_stub = user_id
     document_id_for_stub = document_id
     file_id_for_stub = file_id
     job_type_for_stub = job_type
-    initial_created_at = datetime.now(timezone.utc).isoformat() # Fallback created_at
+    schema_id_for_stub = schema_id # <-- Initialize schema_id for stub
+    initial_created_at = datetime.now(timezone.utc).isoformat() 
     callback_url = None
     # -- End Initialize --
 
     try:
-        # -- Attempt to read initial job data to get original created_at and potentially overwrite stub vars --
+        # -- Attempt to read initial job data --
         try:
             job_data_json = await redis_client.get(f"job:{job_id}")
             if job_data_json:
                 initial_job_data = json.loads(job_data_json)
                 callback_url = initial_job_data.get("callback_url")
                 initial_created_at = initial_job_data.get("created_at", initial_created_at)
-                # Ensure stub variables reflect the original record if found
                 user_id_for_stub = initial_job_data.get("user_id", user_id_for_stub)
                 document_id_for_stub = initial_job_data.get("document_id", document_id_for_stub)
                 file_id_for_stub = initial_job_data.get("file_id", file_id_for_stub)
                 job_type_for_stub = initial_job_data.get("job_type", job_type_for_stub)
+                schema_id_for_stub = initial_job_data.get("schema_id", schema_id_for_stub) # <-- Update schema_id for stub
             else:
                  logger.warning(f"Job {job_id}: Initial job data not found in Redis during assembly start.")
         except json.JSONDecodeError:
@@ -994,30 +1063,32 @@ async def assemble_job_results(
                 "error_summary": error_message
             }
 
-        # 5. Update Final Job Status in Redis (using variables defined at the start)
+        # 5. Update Final Job Status in Redis (passing stub variables defined at the start)
         await update_job_status_in_redis(
             ctx,
             job_id,
-            final_status,
+            final_status, 
             redis_client_override=redis_client,
             results=final_results,
             error_message=error_message,
             total_pages=total_pages,
-            # Pass the necessary data for potential stub creation
             user_id_for_stub=user_id_for_stub,
             document_id_for_stub=document_id_for_stub,
             file_id_for_stub=file_id_for_stub,
             job_type_for_stub=job_type_for_stub,
-            created_at_for_stub=initial_created_at
+            schema_id_for_stub=schema_id_for_stub, # <-- Pass schema_id for stub
+            created_at_for_stub=initial_created_at 
         )
 
         # 6. Update Quota and Send Webhook (if successful)
         if final_status == JobStatus.COMPLETED:
-            _update_usage_quota_in_supabase(supabase_client, document_id)
-            if callback_url: # Use callback_url retrieved earlier
+            # --- Call the new async version --- 
+            await update_usage_quota_in_supabase_async(supabase_client, document_id)
+            if callback_url:
                  job_payload = {
                      "job_id": job_id, "status": final_status.value, "file_id": file_id,
-                     "created_at": initial_created_at, # Use initial_created_at retrieved earlier
+                     "schema_id": schema_id, # <-- Add schema_id to webhook payload
+                     "created_at": initial_created_at, 
                      "updated_at": datetime.now(timezone.utc).isoformat(),
                      "result": final_results
                  }
@@ -1034,11 +1105,11 @@ async def assemble_job_results(
                 redis_client_override=redis_client,
                 error_message=f"Assembly Error: {e}",
                 total_pages=total_pages,
-                # Pass the same stub variables determined at the start of the try block
                 user_id_for_stub=user_id_for_stub,
                 document_id_for_stub=document_id_for_stub,
                 file_id_for_stub=file_id_for_stub,
                 job_type_for_stub=job_type_for_stub,
+                schema_id_for_stub=schema_id_for_stub, # <-- Pass schema_id for stub
                 created_at_for_stub=initial_created_at
             )
         except Exception as final_update_err:
@@ -1065,18 +1136,25 @@ async def assemble_job_results(
 
 async def process_document(
     ctx: dict,
-    job_id: str, document_id: str, file_id: str, user_id: str,
-    callback_url: Optional[str], job_type: str
+    job_id: str, 
+    document_id: str, 
+    file_id: str, 
+    user_id: str,
+    callback_url: Optional[str], 
+    job_type: str,
+    schema_id: Optional[str] = None # <-- Add schema_id parameter
     ):
     """ARQ task to initiate processing by splitting document into page tasks."""
-    supabase = get_sync_supabase_client() # Use sync client for storage download
+    # --- Get Async Client (create directly for now) ---
+    supabase_client: AsyncClient = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
     redis_client = await get_arq_redis_from_ctx(ctx) # Use async client for ARQ enqueue
-    logger.info(f"Job {job_id}: Initiating processing (scatter phase) for doc {document_id} file {file_id}")
+    logger.info(f"Job {job_id}: Initiating processing (scatter phase) for doc {document_id} file {file_id} schema {schema_id or 'default'}")
 
     # --- 1. Create Initial Job Record & Set Status ---
     initial_job_data = {
         "id": job_id, "document_id": document_id, "file_id": file_id,
         "user_id": user_id, "callback_url": callback_url, "job_type": job_type,
+        "schema_id": schema_id, # <-- Store schema_id
         "status": JobStatus.PENDING.value, # Start as pending (pages not dispatched yet)
         "created_at": datetime.now(timezone.utc).isoformat(), # Timestamp when scatter task starts
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1093,21 +1171,62 @@ async def process_document(
         logger.error(f"Job {job_id}: Failed to set initial status in Redis: {redis_err}. Aborting.", exc_info=True)
         return # Cannot proceed
 
-    # --- 2. Download File ---
+    # --- NEW: Fetch Document Type from DB --- 
+    actual_doc_type = None
+    try:
+        doc_response = await supabase_client.table("documents") \
+                                       .select("document_type") \
+                                       .eq("id", document_id) \
+                                       .eq("user_id", user_id) \
+                                       .maybe_single() \
+                                       .execute()
+        if doc_response.data and doc_response.data.get("document_type"):
+            actual_doc_type = doc_response.data["document_type"]
+            logger.info(f"Job {job_id}: Fetched actual document type from DB: {actual_doc_type}")
+        else:
+            # If document not found or type missing, this is a critical error
+            raise FileNotFoundError(f"Document {document_id} not found or missing type in database for user {user_id}.")
+    except Exception as db_err:
+        logger.error(f"Job {job_id}: Failed to fetch document type from database: {db_err}", exc_info=True)
+        await update_job_status_in_redis(
+            ctx, job_id, JobStatus.FAILED,
+            redis_client_override=redis_client,
+            error_message=f"DB Error fetching doc type: {db_err}",
+            # Pass necessary stub data
+            user_id_for_stub=user_id, document_id_for_stub=document_id,
+            file_id_for_stub=file_id, job_type_for_stub=job_type,
+            schema_id_for_stub=schema_id
+        )
+        return
+    # --- END Fetch Document Type --- 
+
+    # --- 2. Download File --- 
     file_bytes = None
     try:
-        bucket_name = "invoices" if job_type == "invoice" else "bank_statements"
+        # --- Use actual_doc_type to determine bucket --- 
+        bucket_name = "invoices" if actual_doc_type == "invoice" else "bank_statements"
+        # --- End Use actual_doc_type ---
         # IMPORTANT: Use file_id for storage path as per upload logic
         storage_path = f"{user_id}/{file_id}"
-        logger.info(f"Job {job_id}: Downloading {storage_path} from bucket {bucket_name}")
-        file_bytes = supabase.storage.from_(bucket_name).download(storage_path)
+        logger.info(f"Job {job_id}: Downloading {storage_path} from bucket {bucket_name} (based on DB type '{actual_doc_type}')")
+        # --- Assuming async storage client usage --- 
+        storage_response = await supabase_client.storage.from_(bucket_name).download(storage_path)
+        file_bytes = storage_response
         if not file_bytes: raise FileNotFoundError(f"Downloaded file is empty: {storage_path}")
         logger.info(f"Job {job_id}: Downloaded {len(file_bytes)} bytes.")
     except Exception as e:
-        logger.error(f"Job {job_id}: Failed to download file {storage_path}: {e}", exc_info=True)
-        await update_job_status_in_redis(ctx, job_id, JobStatus.FAILED, redis_client_override=redis_client, error_message=f"Storage Error: {e}")
+        logger.error(f"Job {job_id}: Failed to download file {storage_path} from bucket {bucket_name}: {e}", exc_info=True)
+        # Update status with error (stub data is passed correctly)
+        await update_job_status_in_redis(
+            ctx, job_id, JobStatus.FAILED, 
+            redis_client_override=redis_client, 
+            error_message=f"Storage Download Error: {e}",
+            user_id_for_stub=user_id, document_id_for_stub=document_id,
+            file_id_for_stub=file_id, job_type_for_stub=actual_doc_type, # Use actual type for stub
+            schema_id_for_stub=schema_id
+        )
         return
-
+    
     # --- 3. Extract Pages and Enqueue Page Tasks ---
     num_pages = 0
     page_tasks_enqueued = 0
@@ -1131,7 +1250,8 @@ async def process_document(
                 user_id_for_stub=user_id,        # Pass user_id
                 document_id_for_stub=document_id, # Pass doc_id
                 file_id_for_stub=file_id,         # Pass file_id
-                job_type_for_stub=job_type        # Pass job_type
+                job_type_for_stub=job_type,        # Pass job_type
+                schema_id_for_stub=schema_id,      # Pass schema_id
             )
 
             for page_num in range(num_pages):
@@ -1140,7 +1260,6 @@ async def process_document(
                 img_bytes = pix.tobytes("png") # Convert to PNG bytes
 
                 # Enqueue process_page task
-                # Use a unique job_id for the ARQ task itself if needed, but link to original job_id
                 await redis_client.enqueue_job(
                     "process_page",
                     _job_id=f"page_{job_id}_{page_num}", # Make ARQ job ID unique per page
@@ -1149,6 +1268,7 @@ async def process_document(
                     file_id=file_id,
                     user_id=user_id,
                     job_type=job_type,
+                    schema_id=schema_id, # <-- Pass schema_id to page task
                     page_num=page_num,
                     total_pages=num_pages,
                     page_image_bytes=img_bytes,
@@ -1167,52 +1287,46 @@ async def process_document(
                 "process_page",
                  _job_id=f"page_{job_id}_0",
                  job_id=job_id, document_id=document_id, file_id=file_id, user_id=user_id,
-                 job_type=job_type, page_num=0, total_pages=1, page_image_bytes=file_bytes
+                 job_type=job_type, 
+                 schema_id=schema_id, # <-- Pass schema_id to page task
+                 page_num=0, total_pages=1, page_image_bytes=file_bytes
             )
             page_tasks_enqueued = 1
             logger.info(f"Job {job_id}: Enqueued 1 page task.")
 
-        # Update status to indicate pages are processing (if any were enqueued)
+        # Update status to PROCESSING (passing stub IDs)
         if page_tasks_enqueued > 0:
              await update_job_status_in_redis(
-                 ctx, 
-                 job_id, 
-                 JobStatus.PROCESSING, 
-                 redis_client_override=redis_client, 
-                 total_pages=num_pages,
-                 user_id_for_stub=user_id
+                 ctx, job_id, JobStatus.PROCESSING, 
+                 redis_client_override=redis_client, total_pages=num_pages,
+                 user_id_for_stub=user_id, # Only user needed here technically
+                 schema_id_for_stub=schema_id, # Pass schema_id to page task
              )
              logger.info(f"Job {job_id}: Scatter phase complete. Status set to PROCESSING.")
-        else:
-             # This case should ideally be caught by num_pages==0 earlier
-             logger.warning(f"Job {job_id}: No pages extracted or enqueued.")
+        else: # No pages enqueued (error)
              await update_job_status_in_redis(
-                 ctx, 
-                 job_id, 
-                 JobStatus.FAILED, 
+                 ctx, job_id, JobStatus.FAILED, 
                  redis_client_override=redis_client, 
                  error_message="No pages found or processed.",
-                 user_id_for_stub=user_id,
-                 document_id_for_stub=document_id,
-                 file_id_for_stub=file_id,
-                 job_type_for_stub=job_type
+                 user_id_for_stub=user_id, document_id_for_stub=document_id,
+                 file_id_for_stub=file_id, job_type_for_stub=job_type,
+                 schema_id_for_stub=schema_id, # Pass schema_id to page task
              )
 
 
     except Exception as e:
         logger.error(f"Job {job_id}: Failed during page extraction/enqueue: {e}", exc_info=True)
         await update_job_status_in_redis(
-            ctx, 
-            job_id, 
-            JobStatus.FAILED, 
+            ctx, job_id, JobStatus.FAILED, 
             redis_client_override=redis_client, 
             error_message=f"Page Processing Error: {e}",
-            user_id_for_stub=user_id,
-            document_id_for_stub=document_id,
-            file_id_for_stub=file_id,
-            job_type_for_stub=job_type
+            user_id_for_stub=user_id, document_id_for_stub=document_id,
+            file_id_for_stub=file_id, job_type_for_stub=job_type,
+            schema_id_for_stub=schema_id, # Pass schema_id to page task
         )
-        return# --- ARQ Worker Settings (MODIFIED cron_jobs) --- 
+        return
+
+# --- ARQ Worker Settings (MODIFIED cron_jobs) --- 
 
 # This class defines the functions available to the worker
 class WorkerSettings:

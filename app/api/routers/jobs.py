@@ -1,6 +1,6 @@
 from typing import List, Optional, Annotated
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Path
-from supabase import Client
+from supabase import Client, AsyncClient
 import uuid
 import math
 from datetime import datetime, timezone
@@ -29,7 +29,7 @@ def get_sync_redis_client_for_api() -> redis.Redis:
     """Creates a synchronous Redis client for API endpoints."""
     return redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
 
-async def get_job_from_db(supabase: Client, job_id: str, user_id: str) -> Optional[dict]:
+async def get_job_from_db(supabase: AsyncClient, job_id: str, user_id: str) -> Optional[dict]:
     """Fetches job status from the DB."""
     try:
         response = await supabase.table("jobs").select("*, documents(file_name)").eq("id", job_id).eq("user_id", user_id).maybe_single().execute()
@@ -38,7 +38,7 @@ async def get_job_from_db(supabase: Client, job_id: str, user_id: str) -> Option
         print(f"Error fetching job {job_id}: {e}")
         return None
 
-async def list_jobs_from_db(supabase: Client, user_id: str, job_type: str, params: PaginationParams) -> (List[dict], int):
+async def list_jobs_from_db(supabase: AsyncClient, user_id: str, job_type: str, params: PaginationParams) -> (List[dict], int):
     """Lists jobs from the DB with pagination."""
     offset = (params.page - 1) * params.page_size
     query = supabase.table("jobs").select("*, documents(file_name)", count="exact").eq("user_id", user_id).eq("job_type", job_type)
@@ -57,7 +57,7 @@ async def list_jobs_from_db(supabase: Client, user_id: str, job_type: str, param
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list jobs")
 
 # --- Batch Processing Functions (DB interaction for batch metadata) ---
-async def get_batch_job_record(supabase: Client, batch_id: str, user_id: str) -> Optional[dict]:
+async def get_batch_job_record(supabase: AsyncClient, batch_id: str, user_id: str) -> Optional[dict]:
     """Retrieves a batch job from the database."""
     try:
         response = await supabase.table("batch_jobs").select("*").eq("id", batch_id).eq("user_id", user_id).maybe_single().execute()
@@ -74,11 +74,11 @@ router = APIRouter(
 )
 
 # --- Helper to Verify Document --- 
-async def verify_document_access(supabase: Client, doc_id: str, user_id: str):
+async def verify_document_access(supabase: AsyncClient, doc_id: str, user_id: str):
     """Verify the user owns the document and it exists."""
     print(f"Executing in: jobs.py - verify_document_access for doc_id: {doc_id}")
     try:
-        doc_response = supabase.table("documents").select("id, document_type").eq("id", doc_id).eq("user_id", user_id).maybe_single().execute()
+        doc_response = await supabase.table("documents").select("id, document_type").eq("id", doc_id).eq("user_id", user_id).maybe_single().execute()
         if not doc_response.data:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document with ID '{doc_id}' not found or access denied.")
         return doc_response.data # Return doc info (including type)
@@ -132,7 +132,7 @@ async def verify_document_access(supabase: Client, doc_id: str, user_id: str):
 async def submit_statement_job(
     request_data: ParseRequestModel, # <-- Changed back to ParseRequestModel
     auth: AuthData, # <-- Uncommented
-    supabase: Annotated[Client, Depends(get_supabase_client)], # <-- Uncommented
+    supabase: Annotated[AsyncClient, Depends(get_supabase_client)], # <-- Ensure AsyncClient
     arq_redis: Annotated[ArqRedis, Depends(get_arq_redis)] # <-- Uncommented
 ):
     """Submit a bank statement for parsing."""
@@ -175,32 +175,23 @@ async def submit_statement_job(
     #     # Consider rolling back or cleaning up if needed
     #     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create job record")
 
-    # 3. Enqueue the ARQ Task with all necessary job details
+    # 3. Enqueue the ARQ Task
     try:
         ctx = {"arq_redis": arq_redis}
-        # Pass all necessary info for the worker to create the job record
+        # Pass all necessary info for the worker 
         job_params = {
             "job_id": job_id, 
             "document_id": doc_id,
             "file_id": request_data.file_id, # Pass file_id
             "user_id": user_id, # Pass user_id
+            "schema_id": request_data.schema_id, # <-- Pass schema_id
             "callback_url": str(request_data.callback_url) if request_data.callback_url else None, # Pass callback_url
             "job_type": "bank_statement" # Pass job_type
         }
         await enqueue_job(ctx, "process_document", job_params)
         print(f"Enqueued job {job_id} with params: {job_params}") # Log enqueued params
     except Exception as e:
-        # If enqueue fails, update DB job status to FAILED
-        # NOTE: We can't update the job status here anymore since it doesn't exist yet.
-        # Log the enqueue failure. The worker won't pick it up.
         print(f"Fatal error: Failed to enqueue job {job_id}: {e}")
-        # Consider how to handle this - maybe return 500 immediately?
-        # For now, raising the 500 seems appropriate as the job cannot be processed.
-        # print(f"Error enqueuing job {job_id}: {e}. Updating job status to failed.")
-        # try:
-        #     await supabase.table("jobs").update({"status": JobStatus.FAILED.value, "error_message": "Enqueue failed"}).eq("id", job_id).execute()
-        # except Exception as db_err:
-        #     print(f"Error updating job {job_id} status to failed after enqueue error: {db_err}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to enqueue job: {e}")
 
     # 4. Return Job ID and Accepted status
@@ -378,7 +369,7 @@ async def list_statement_jobs(
 async def submit_invoice_job(
     request_data: ParseRequestModel,
     auth: AuthData,
-    supabase: Annotated[Client, Depends(get_supabase_client)],
+    supabase: Annotated[AsyncClient, Depends(get_supabase_client)],
     arq_redis: Annotated[ArqRedis, Depends(get_arq_redis)]
 ):
     """Submit an invoice for parsing."""
@@ -409,6 +400,7 @@ async def submit_invoice_job(
             "document_id": doc_id,
             "file_id": request_data.file_id, # Pass file_id
             "user_id": user_id, # Pass user_id
+            "schema_id": request_data.schema_id, # <-- Pass schema_id
             "callback_url": str(request_data.callback_url) if request_data.callback_url else None, # Pass callback_url
             "job_type": "invoice" # Set job_type to invoice
         }
@@ -610,6 +602,7 @@ async def _submit_batch(
                 "document_id": doc_id,
                 "file_id": file_id, 
                 "user_id": user_id,
+                "schema_id": file_info.schema_id, # <-- Pass schema_id from file_info
                 "callback_url": request_data.callback_url, # Pass batch callback?
                 "job_type": job_type
             }

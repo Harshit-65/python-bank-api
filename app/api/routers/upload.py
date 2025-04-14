@@ -6,7 +6,7 @@ import json
 from typing import List, Annotated, Optional
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status, Request, Form, Query
 from fastapi.security import OAuth2PasswordBearer # Import oauth2_scheme
-from supabase.client import Client
+from supabase.client import AsyncClient
 from supabase.lib.client_options import ClientOptions
 from supabase._sync.client import SyncStorageClient # Updated import path
 # Import the helper function and specific exceptions, not AuthData type alias
@@ -89,11 +89,8 @@ async def validate_file(file: UploadFile): # Make async as it reads the file
 
 # --- Helper Functions ---
 
-def get_storage_client(supabase: Client = Depends(get_supabase_client)) -> SyncStorageClient:
-    """Dependency to get the Supabase storage client."""
-    # Note: supabase-py v1.x storage client might be synchronous. Adjust if using v2+.
-    # If async storage client is available and preferred, make this function async
-    # and adjust usage in the endpoint.
+async def get_storage_client(supabase: AsyncClient = Depends(get_supabase_client)) -> SyncStorageClient:
+    """Dependency to get the Supabase storage client (potentially async)."""
     return supabase.storage
 
 async def upload_file_to_storage(
@@ -125,7 +122,7 @@ async def upload_file_to_storage(
         # Assuming sync storage client for now based on current supabase-py
         # Use `await storage.from_(bucket).upload(...)` if async client is used
         print(f"[Upload] Attempting to upload to storage path: {storage_path} in bucket: {bucket}") # DEBUG
-        storage.from_(bucket).upload(
+        await storage.from_(bucket).upload(
             path=storage_path,
             file=content,
             file_options={"content-type": content_type, "upsert": "true"} # upsert=true replaces if exists
@@ -235,7 +232,7 @@ async def handle_upload(
     # Inject dependencies needed for manual auth + upload
     request: Request,
     token: Annotated[str | None, Depends(oauth2_scheme)],
-    supabase: Annotated[Client, Depends(get_supabase_client)],
+    supabase: Annotated[AsyncClient, Depends(get_supabase_client)],
     storage: Annotated[SyncStorageClient, Depends(get_storage_client)],
     files: Annotated[List[UploadFile], File(description=f"Files to upload (max {MAX_FILES}, types: {', '.join(ALLOWED_EXTENSIONS)})")] = [],
     doc_type: Annotated[Optional[str], Form()] = None,  # Fixed: Use = for default value
@@ -345,8 +342,8 @@ async def handle_upload(
             }
             print(f"[Upload] Inserting document record into DB: {db_record}") # DEBUG
             try:
-                # Remove await for sync Supabase client
-                insert_response = supabase.table("documents").insert(db_record, returning="representation").execute()
+                # Use await for async Supabase client
+                insert_response = await supabase.table("documents").insert(db_record, returning="representation").execute()
                 print(f"[Upload] DB insert response: {insert_response}") # DEBUG
 
                 if not insert_response.data or not insert_response.data[0].get('id'):
@@ -378,7 +375,8 @@ async def handle_upload(
             # If DB record was created but upload failed, potentially update status to 'failed'
             if doc_id:
                  try:
-                    supabase.table("documents").update({"status": "failed"}).eq("id", doc_id).execute()
+                    # Use await for async Supabase client
+                    await supabase.table("documents").update({"status": "failed"}).eq("id", doc_id).execute()
                     print(f"[Upload] Updated document status to 'failed' for doc_id: {doc_id}")
                  except Exception as db_update_err:
                      print(f"[Upload] Failed to update status for failed upload doc {doc_id}: {db_update_err}")
@@ -390,7 +388,8 @@ async def handle_upload(
             print(f"[Upload] Unexpected Exception for {file.filename}: {upload_error}") # DEBUG
             if doc_id:
                  try:
-                    supabase.table("documents").update({"status": "failed"}).eq("id", doc_id).execute()
+                    # Use await for async Supabase client
+                    await supabase.table("documents").update({"status": "failed"}).eq("id", doc_id).execute()
                     print(f"[Upload] Updated document status to 'failed' for doc_id: {doc_id}")
                  except Exception as db_update_err:
                      print(f"[Upload] Failed to update status for failed upload doc {doc_id}: {db_update_err}")

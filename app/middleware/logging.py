@@ -8,12 +8,12 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp
-from supabase import Client
+from supabase import Client, AsyncClient
 
 from ..db.supabase_client import get_supabase_client
 
 async def log_api_usage_to_supabase(
-    supabase: Client,
+    supabase: AsyncClient,
     user_id: str,
     api_key_id: str,
     endpoint: str,
@@ -63,7 +63,7 @@ async def log_api_usage_to_supabase(
         }
 
         # Insert log into Supabase
-        result = supabase.table("api_logs").insert(log_data).execute()
+        result = await supabase.table("api_logs").insert(log_data).execute()
         
         if hasattr(result, "error") and result.error:
             print(f"Error logging API usage: {result.error}")
@@ -71,9 +71,8 @@ async def log_api_usage_to_supabase(
         print(f"Error logging API usage: {str(e)}")
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: ASGIApp, supabase: Client):
+    def __init__(self, app: ASGIApp):
         super().__init__(app)
-        self.supabase = supabase
 
     async def dispatch(self, request: Request, call_next):
         print(f"Executing in: logging.py - dispatch for {request.method} {request.url.path}")
@@ -106,6 +105,13 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         user_id = getattr(request.state, "user_id", None)
         api_key_id = getattr(request.state, "api_key_id", None)
         
+        # Get supabase client from request/app state
+        try:
+            supabase_client = request.app.state.supabase
+        except AttributeError:
+            print("ERROR: Supabase client not found in app state. Logging middleware cannot function.")
+            return response # Cannot log without client
+
         # Skip logging if user_id or api_key_id is null
         if user_id is None or api_key_id is None:
             print(f"Skipping log for {method} {endpoint}: Missing user_id or api_key_id")
@@ -113,7 +119,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         
         # Log API usage
         await log_api_usage_to_supabase(
-            supabase=self.supabase,
+            supabase=supabase_client,
             user_id=user_id,
             api_key_id=api_key_id,
             endpoint=endpoint,

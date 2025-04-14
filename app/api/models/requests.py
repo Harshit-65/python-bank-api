@@ -1,3 +1,4 @@
+import uuid
 from typing import List, Optional
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, AnyHttpUrl
@@ -20,6 +21,7 @@ class JobStatus(str, Enum):
 class BatchFileModel(BaseModel):
     file_id: str = Field(..., description="The ID of the file to process")
     document_id: Optional[str] = Field(None, description="The ID of the document (if different from file_id)")
+    schema_id: Optional[str] = Field(None, description="Optional custom schema ID (UUID format) to use for this specific file")
 
     @field_validator('file_id')
     @classmethod
@@ -42,7 +44,18 @@ class BatchRequestModel(BaseModel):
 class ParseRequestModel(BaseModel):
     file_id: str = Field(..., min_length=1)
     document_id: str = Field(..., min_length=1)
+    schema_id: Optional[str] = Field(None, description="Optional custom schema ID (UUID format) to use for parsing")
     callback_url: Optional[str] = None
+
+    @field_validator('schema_id')
+    @classmethod
+    def validate_schema_id_format(cls, v: Optional[str]):
+        if v is not None:
+            try:
+                uuid.UUID(v)
+            except ValueError:
+                raise ValueError('Invalid schema_id format. Must be a valid UUID.')
+        return v
 
 # --- Models for Query Parameters (used in List requests) ---
 

@@ -4,9 +4,8 @@ from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 
 from ..config import KEYFOLIO_URL
-from ..db.supabase_client import get_supabase_client
+from ..db.supabase_client import get_supabase_client, AsyncClient
 from .models import KeyfolioResponse
-from supabase import Client
 
 # Although we use Bearer tokens, OAuth2PasswordBearer is a convenient way 
 # to extract the token from the Authorization header.
@@ -51,11 +50,14 @@ class RateLimitExceededError(HTTPException):
             headers={"Retry-After": str(reset_after_ms // 1000)}, # Retry-After is in seconds
         )
 
-async def _get_user_from_supabase(api_key: str, supabase: Client) -> Dict[str, Any]:
+async def _get_user_from_supabase(api_key: str, supabase: AsyncClient) -> Dict[str, Any]:
     """Internal helper: Fetches user details from Supabase using the API key hash."""
     try:
-        # Use sync client for Supabase v1 DB ops
-        response = supabase.table("api_keys").select("id, user_id").eq("key_hash", api_key).execute()
+        # Use async client and AWAIT the call
+        response = await supabase.table("api_keys").select("id, user_id").eq("key_hash", api_key).execute()
+        
+        # Supabase V2+ returns response.data, V1 might need different handling if API changed
+        # Assuming V2+ response structure based on async client usage
         if not response.data:
             raise APIKeyNotFound()
         # Assuming one key matches
@@ -73,7 +75,7 @@ async def _get_user_from_supabase(api_key: str, supabase: Client) -> Dict[str, A
             },
         )
 
-async def _perform_key_verification(api_key: str, supabase: Client) -> Dict[str, Any]:
+async def _perform_key_verification(api_key: str, supabase: AsyncClient) -> Dict[str, Any]:
     """Performs Keyfolio check and fetches user data from Supabase.
     Raises specific HTTPExceptions on failure.
     Returns user data dictionary (user_id, api_key_id) on success.
@@ -115,7 +117,7 @@ async def _perform_key_verification(api_key: str, supabase: Client) -> Dict[str,
 
 async def verify_api_key(request: Request,
                        token: Annotated[str | None, Depends(oauth2_scheme)],
-                       supabase: Annotated[Client, Depends(get_supabase_client)]) -> Dict[str, Any]:
+                       supabase: Annotated[AsyncClient, Depends(get_supabase_client)]) -> Dict[str, Any]:
     """FastAPI dependency to verify API key via Keyfolio and fetch user data.
     
     This function now primarily acts as a wrapper for the core logic
