@@ -34,28 +34,29 @@ This project is a Python FastAPI implementation of the Bank Statement and Invoic
 
 ## Environment Variables
 
-Create a `.env` file in the `python-bank-api` root directory and populate it with the necessary credentials and configurations. See the `.env.example` file (if provided) or the list below:
+This project requires several environment variables to be set for accessing external services like Supabase, Redis, Google AI, and Keyfolio.
 
-```env
-# Supabase Credentials (Required)
-SUPABASE_URL=https://<your_project_ref>.supabase.co
-SUPABASE_KEY=<your_supabase_service_role_key>
+1.  **Copy the Example File:** Create a copy of the `.env.example` file in the project root directory and name it `.env`.
+    *   On macOS/Linux:
+        ```bash
+        cp .env.example .env
+        ```
+    *   On Windows (Command Prompt):
+        ```bash
+        copy .env.example .env
+        ```
+    *   On Windows (PowerShell):
+        ```bash
+        Copy-Item .env.example .env
+        ```
 
-# Redis Configuration (Required)
-REDIS_URL=redis://[:password@]host:port[/db] # e.g., redis://localhost:6379 or redis://:<password>@hostname:port
-REDIS_PASSWORD=<your_redis_password> # Required if your Redis instance uses a password
+2.  **Edit `.env**: Open the newly created `.env` file in a text editor.
 
-# Google AI API Key (Required for parsing)
-# Provide at least one key. Add GOOGLE_API_KEY2, GOOGLE_API_KEY3, etc., for load balancing.
-GOOGLE_API_KEY=<your_google_ai_api_key>
-# GOOGLE_API_KEY2=...
+3.  **Fill in Values:** Replace the placeholder values (like `<your_value>`, example URLs, etc.) with your actual credentials and configuration details for each required service.
 
-# Keyfolio Configuration (Required for Authentication)
-KEYFOLIO_URL=https://keyfolio-febpthnnhq-ue.a.run.app # Or your Keyfolio instance URL
-# KEYFOLIO_ADMIN_KEY=... # Needed for managing keys, not for running the API itself
-```
+4.  **Save the File:** Ensure the file is saved.
 
-
+The application automatically loads these variables when it starts.
 
 ## Running the API
 
@@ -91,109 +92,559 @@ Authorization: Bearer <your_api_key>
 
 The API key is verified against the Keyfolio service and linked to a `user_id` via the Supabase `api_keys` table.
 
-## Available API Endpoints
+## API Endpoint Guide
 
-The base path for all endpoints is `/api/v1`.
+This section provides details on how to use each endpoint, including examples for testing with tools like Postman.
 
-### Health Check
+**Base URL:** `http://localhost:8000/api/v1` (assuming the API is running locally on port 8000)
 
-*   **`GET /health`**: Checks the status of the API and its connection to the database. (No Auth Required)
+---
 
-### File Upload
+### 1. Health Check
 
-*   **`POST /parse/upload`**: Uploads one or more files (PDF, JPG, PNG).
-    *   Performs validation (type, size, PDF integrity).
-    *   Classifies PDFs using Gemini (invoice/bank\_statement).
-    *   Creates a `documents` record in Supabase.
-    *   Uploads the file to the appropriate Supabase Storage bucket (`invoices` or `bank_statements`).
-    *   Returns `file_id` (used for storage path), `doc_id` (database record ID), `file_url`, and determined `type` for each file.
-    *   Requires `Authorization` header.
-    *   Accepts `multipart/form-data`. Use `files` for the file uploads.
+Checks the operational status of the API and its dependencies.
 
-### Bank Statement Parsing
+*   **Endpoint:** `GET /health`
+*   **Full URL:** `http://localhost:8000/api/v1/health`
+*   **Description:** Verifies connectivity to the database and returns the overall service status.
+*   **Authentication:** None Required
 
-*   **`POST /parse/statements`**: Submits an uploaded bank statement for parsing.
-    *   Requires `Authorization` header.
-    *   Request Body: `ParseRequestModel` (JSON)
-        ```json
-        {
-          "file_id": "timestamp_filename.pdf", // The file_id returned by upload
-          "document_id": "uuid-of-document-record", // The doc_id returned by upload
-          "callback_url": "optional-url-for-notification"
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "status": "ok",
+        "timestamp": "2025-04-15T10:30:00.123456Z",
+        "services": {
+          "database": {
+            "status": true,
+            "message": null
+          }
         }
-        ```
-    *   Enqueues a background job (`process_document` task).
-    *   Returns a `JobCreatedResponseModel` with `job_id` and `status: pending`.
+      }
+    }
+    ```
+*   **Postman Setup:**
+    *   Method: `GET`
+    *   URL: `http://localhost:8000/api/v1/health`
+    *   Auth: `No Auth`
+    *   Body: `none`
 
-*   **`GET /parse/statements/{job_id}`**: Retrieves the status and results of a specific bank statement parsing job.
-    *   Requires `Authorization` header.
-    *   Path Parameter: `job_id`.
-    *   Fetches job data from Redis.
-    *   Returns a `JobResponseModel` including status, results (if completed), error message (if failed), timestamps.
+---
 
-*   **`GET /parse/statements`**: Lists bank statement parsing jobs for the user.
-    *   Requires `Authorization` header.
-    *   Query Parameters: `page` (int, default 1), `page_size` (int, default 20), `status` (optional: pending, processing, completed, failed).
-    *   Fetches job data from Redis.
-    *   Returns a `PaginatedJobResponse`.
+### 2. Schema Management
 
-*   **`POST /parse/statements/batch`**: Submits a batch of uploaded bank statements for parsing.
-    *   Requires `Authorization` header.
-    *   Request Body: `BatchRequestModel` (JSON)
-        ```json
+Endpoints for creating, listing, retrieving, updating, and deleting custom parsing schemas.
+
+#### 2.1 Create Schema
+
+*   **Endpoint:** `POST /schemas`
+*   **Full URL:** `http://localhost:8000/api/v1/schemas`
+*   **Description:** Creates a new custom schema (e.g., for invoices or bank statements).
+*   **Authentication:** Required (`Bearer Token`)
+
+*   **Example Request Body (JSON):**
+    ```json
+    {
+      "name": "My Custom Invoice Schema v1",
+      "type": "invoice",
+      "description": "Schema for standard vendor invoices.",
+      "schema_string": "{\\\"invoice_number\\\": \\\"\\\", \\\"invoice_date\\\": \\\"\\\", \\\"total_amount\\\": 0.0}"
+    }
+    ```
+    *Note: The `schema_string` must be a valid JSON string itself.*
+
+*   **Example Success Response (201 Created):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+        "name": "My Custom Invoice Schema v1",
+        "type": "invoice",
+        "description": "Schema for standard vendor invoices.",
+        "version": 1,
+        "created_at": "2025-04-15T10:35:00.987654Z",
+        "updated_at": "2025-04-15T10:35:00.987654Z"
+      }
+    }
+    ```
+
+*   **Postman Setup:**
+    *   Method: `POST`
+    *   URL: `http://localhost:8000/api/v1/schemas`
+    *   Auth: `Bearer Token` (Paste your API key)
+    *   Body: `raw`, `JSON`
+    *   Body Content: (Paste the Example Request Body JSON)
+
+#### 2.2 List Schemas
+
+*   **Endpoint:** `GET /schemas/list`
+*   **Full URL:** `http://localhost:8000/api/v1/schemas/list`
+*   **Description:** Lists active schemas for the user, with pagination and optional type filtering.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Query Parameters:**
+    *   `page` (integer, optional, default: 1)
+    *   `page_size` (integer, optional, default: 20)
+    *   `type` (string, optional, values: `invoice` or `bank_statement`)
+*   **Example URL with Query Params:** `http://localhost:8000/api/v1/schemas/list?page=1&page_size=10&type=invoice`
+
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "schemas": [
+          {
+            "id": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+            "name": "My Custom Invoice Schema v1",
+            "type": "invoice",
+            "description": "Schema for standard vendor invoices.",
+            "version": 1,
+            "created_at": "2025-04-15T10:35:00.987654Z",
+            "updated_at": "2025-04-15T10:35:00.987654Z"
+          }
+          // ... more schemas ...
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 10
+      }
+    }
+    ```
+
+*   **Postman Setup:**
+    *   Method: `GET`
+    *   URL: `http://localhost:8000/api/v1/schemas/list`
+    *   Auth: `Bearer Token`
+    *   Params: (Add query parameters like `page`, `page_size`, `type` as needed)
+    *   Body: `none`
+
+#### 2.3 Get Schema Details
+
+*   **Endpoint:** `GET /schemas/id/{schema_id}`
+*   **Full URL Example:** `http://localhost:8000/api/v1/schemas/id/a1b2c3d4-e5f6-7890-1234-567890abcdef`
+*   **Description:** Retrieves full details of a specific schema, including the `schema_string`.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Path Parameter:** `schema_id` (UUID of the schema)
+
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+        "name": "My Custom Invoice Schema v1",
+        "type": "invoice",
+        "description": "Schema for standard vendor invoices.",
+        "version": 1,
+        "created_at": "2025-04-15T10:35:00.987654Z",
+        "updated_at": "2025-04-15T10:35:00.987654Z",
+        "schema_string": "{\\\"invoice_number\\\": \\\"\\\", \\\"invoice_date\\\": \\\"\\\", \\\"total_amount\\\": 0.0}"
+      }
+    }
+    ```
+
+*   **Postman Setup:**
+    *   Method: `GET`
+    *   URL: `http://localhost:8000/api/v1/schemas/id/<YOUR_SCHEMA_ID>` (Replace `<YOUR_SCHEMA_ID>`)
+    *   Auth: `Bearer Token`
+    *   Body: `none`
+
+#### 2.4 Update Schema
+
+*   **Endpoint:** `PUT /schemas/id/{schema_id}`
+*   **Full URL Example:** `http://localhost:8000/api/v1/schemas/id/a1b2c3d4-e5f6-7890-1234-567890abcdef`
+*   **Description:** Updates the `description` and/or `schema_string` of an existing schema. Increments the version number automatically.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Path Parameter:** `schema_id` (UUID of the schema)
+
+*   **Example Request Body (JSON):**
+    ```json
+    {
+      "description": "Updated description for standard vendor invoices.",
+      "schema_string": "{\\\"invoice_number\\\": \\\"\\\", \\\"invoice_date\\\": \\\"\\\", \\\"total_amount\\\": 0.0, \\\"vendor_name\\\": \\\"\\\"}"
+    }
+    ```
+
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "id": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+        "name": "My Custom Invoice Schema v1", // Name doesn't change
+        "type": "invoice", // Type doesn't change
+        "description": "Updated description for standard vendor invoices.",
+        "version": 2, // Version incremented
+        "created_at": "2025-04-15T10:35:00.987654Z",
+        "updated_at": "2025-04-15T10:40:00.112233Z", // Updated timestamp
+        "schema_string": "{\\\"invoice_number\\\": \\\"\\\", \\\"invoice_date\\\": \\\"\\\", \\\"total_amount\\\": 0.0, \\\"vendor_name\\\": \\\"\\\"}"
+      }
+    }
+    ```
+
+*   **Postman Setup:**
+    *   Method: `PUT`
+    *   URL: `http://localhost:8000/api/v1/schemas/id/<YOUR_SCHEMA_ID>` (Replace `<YOUR_SCHEMA_ID>`)
+    *   Auth: `Bearer Token`
+    *   Body: `raw`, `JSON`
+    *   Body Content: (Paste the Example Request Body JSON)
+
+#### 2.5 Delete Schema
+
+*   **Endpoint:** `DELETE /schemas/id/{schema_id}`
+*   **Full URL Example:** `http://localhost:8000/api/v1/schemas/id/a1b2c3d4-e5f6-7890-1234-567890abcdef`
+*   **Description:** Soft-deletes a schema (marks it as inactive).
+*   **Authentication:** Required (`Bearer Token`)
+*   **Path Parameter:** `schema_id` (UUID of the schema)
+
+*   **Example Success Response:** `204 No Content` (No response body)
+
+*   **Postman Setup:**
+    *   Method: `DELETE`
+    *   URL: `http://localhost:8000/api/v1/schemas/id/<YOUR_SCHEMA_ID>` (Replace `<YOUR_SCHEMA_ID>`)
+    *   Auth: `Bearer Token`
+    *   Body: `none`
+
+---
+
+### 3. File Upload
+
+Uploads files for later processing.
+
+*   **Endpoint:** `POST /parse/upload`
+*   **Full URL:** `http://localhost:8000/api/v1/parse/upload`
+*   **Description:** Uploads one or more files (PDF, JPG, PNG), classifies them, saves them to storage, and creates document records.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Request Body Type:** `multipart/form-data`
+
+*   **Example Success Response (200 OK or 207 Multi-Status if partial errors):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "files": [
+          {
+            "file_id": "1713177600123456789_invoice.pdf", // Timestamped unique filename
+            "file_url": "http://localhost:8000/storage/v1/object/public/invoices/user-id-123/1713177600123456789_invoice.pdf", // Example URL format
+            "doc_id": "b1c2d3e4-f5g6-7890-1234-567890abcdef",
+            "error": null,
+            "type": "invoice"
+          },
+          {
+            "file_id": "1713177605987654321_statement.png",
+            "file_url": "http://localhost:8000/storage/v1/object/public/bank_statements/user-id-123/1713177605987654321_statement.png",
+            "doc_id": "c2d3e4f5-g6h7-8901-2345-678901bcdefg",
+            "error": null,
+            "type": "bank_statement"
+          }
+        ],
+        "status": "done" // or "partial_error"
+      }
+    }
+    ```
+
+*   **Postman Setup:**
+    *   Method: `POST`
+    *   URL: `http://localhost:8000/api/v1/parse/upload`
+    *   Auth: `Bearer Token`
+    *   Body: `form-data`
+    *   Body Content:
+        *   Add one or more keys named `files`.
+        *   For each `files` key, change the type from `Text` to `File`.
+        *   Select the file(s) you want to upload from your computer.
+
+---
+
+### 4. Bank Statement Parsing
+
+Endpoints specific to submitting and managing bank statement parsing jobs.
+
+#### 4.1 Submit Bank Statement Job
+
+*   **Endpoint:** `POST /parse/statements`
+*   **Full URL:** `http://localhost:8000/api/v1/parse/statements`
+*   **Description:** Submits a previously uploaded bank statement for asynchronous parsing. Can optionally specify a custom schema.
+*   **Authentication:** Required (`Bearer Token`)
+
+*   **Example Request Body (JSON):**
+    ```json
+    {
+      "file_id": "1713177605987654321_statement.png", // file_id from upload response
+      "document_id": "c2d3e4f5-g6h7-8901-2345-678901bcdefg", // doc_id from upload response
+      "schema_id": null, // Or "uuid-of-custom-bank-statement-schema"
+      "callback_url": "https://your-webhook-listener.com/callback" // Optional
+    }
+    ```
+
+*   **Example Success Response (202 Accepted):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "job_id": "job_d1e2f3a4-b5c6-7890-1234-567890abcdef",
+        "status": "pending",
+        "created_at": "2025-04-15T10:50:00.123123Z",
+        "updated_at": "2025-04-15T10:50:00.123123Z"
+      }
+    }
+    ```
+
+*   **Postman Setup:**
+    *   Method: `POST`
+    *   URL: `http://localhost:8000/api/v1/parse/statements`
+    *   Auth: `Bearer Token`
+    *   Body: `raw`, `JSON`
+    *   Body Content: (Paste the Example Request Body JSON, using IDs from your upload response)
+
+#### 4.2 Get Bank Statement Job Status
+
+*   **Endpoint:** `GET /parse/statements/{job_id}`
+*   **Full URL Example:** `http://localhost:8000/api/v1/parse/statements/job_d1e2f3a4-b5c6-7890-1234-567890abcdef`
+*   **Description:** Retrieves the status and results (if completed/failed) of a specific bank statement job.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Path Parameter:** `job_id` (from the submit response)
+
+*   **Example Success Response (200 OK - Completed):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "job_id": "job_d1e2f3a4-b5c6-7890-1234-567890abcdef",
+        "status": "completed",
+        "created_at": "2025-04-15T10:50:00.123123Z",
+        "updated_at": "2025-04-15T10:55:00.456456Z",
+        "result": {
+          // ... Parsed bank statement data ...
+          "all_transactions": [ ... ],
+          "average_confidence_score": 0.85,
+          "total_pages": 1
+        },
+        "error": null
+      }
+    }
+    ```
+*   **Example Success Response (200 OK - Processing):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "job_id": "job_d1e2f3a4-b5c6-7890-1234-567890abcdef",
+        "status": "processing",
+        "created_at": "2025-04-15T10:50:00.123123Z",
+        "updated_at": "2025-04-15T10:52:00.789789Z",
+        "result": null,
+        "error": null
+      }
+    }
+    ```
+
+*   **Postman Setup:**
+    *   Method: `GET`
+    *   URL: `http://localhost:8000/api/v1/parse/statements/<YOUR_JOB_ID>` (Replace `<YOUR_JOB_ID>`)
+    *   Auth: `Bearer Token`
+    *   Body: `none`
+
+#### 4.3 List Bank Statement Jobs
+
+*   **Endpoint:** `GET /parse/statements`
+*   **Full URL:** `http://localhost:8000/api/v1/parse/statements`
+*   **Description:** Lists bank statement jobs for the user, with pagination and filtering.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Query Parameters:**
+    *   `page` (integer, optional, default: 1)
+    *   `page_size` (integer, optional, default: 20)
+    *   `status` (string, optional, values: `pending`, `processing`, `completed`, `failed`)
+*   **Example URL:** `http://localhost:8000/api/v1/parse/statements?page_size=5&status=completed`
+
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "jobs": [
+          {
+            "job_id": "job_d1e2f3a4-b5c6-7890-1234-567890abcdef",
+            "status": "completed",
+            "created_at": "2025-04-15T10:50:00.123123Z",
+            "updated_at": "2025-04-15T10:55:00.456456Z",
+            "error_message": null,
+            "file_id": "1713177605987654321_statement.png"
+          }
+          // ... more jobs ...
+        ],
+        "total": 1,
+        "page": 1,
+        "page_size": 5,
+        "total_pages": 1
+      }
+    }
+    ```
+
+*   **Postman Setup:**
+    *   Method: `GET`
+    *   URL: `http://localhost:8000/api/v1/parse/statements`
+    *   Auth: `Bearer Token`
+    *   Params: (Add query parameters like `page_size`, `status` as needed)
+    *   Body: `none`
+
+#### 4.4 Submit Bank Statement Batch Job
+
+*   **Endpoint:** `POST /parse/statements/batch`
+*   **Full URL:** `http://localhost:8000/api/v1/parse/statements/batch`
+*   **Description:** Submits multiple bank statements for batch processing.
+*   **Authentication:** Required (`Bearer Token`)
+
+*   **Example Request Body (JSON):**
+    ```json
+    {
+      "files": [
         {
-          "files": [
-            { "file_id": "file1.pdf", "document_id": "doc_id_1"},
-            { "file_id": "file2.pdf", "document_id": "doc_id_2" }
-            // ... up to 50 files
-          ],
-          "callback_url": "optional-url-for-batch-notification"
+          "file_id": "1713177605987654321_statement.png",
+          "document_id": "c2d3e4f5-g6h7-8901-2345-678901bcdefg",
+          "schema_id": null // Optional schema per file
+        },
+        {
+          "file_id": "1713177700112233445_other_statement.pdf",
+          "document_id": "d3e4f5g6-h7i8-9012-3456-789012cdefgh",
+          "schema_id": null
         }
-        ```
-    *   Enqueues multiple individual jobs.
-    *   Creates batch metadata in Redis.
-    *   Returns a `BatchCreatedResponseModel` with `batch_id`.
+      ],
+      "callback_url": "https://your-webhook-listener.com/batch_callback" // Optional
+    }
+    ```
 
-*   **`GET /parse/statements/batch/{batch_id}`**: Retrieves the status of a batch job and the status of its constituent files.
-    *   Requires `Authorization` header.
-    *   Path Parameter: `batch_id`.
-    *   Fetches batch and job data from Redis.
-    *   Returns a `BatchStatusResponseModel`.
+*   **Example Success Response (202 Accepted):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "batch_id": "batch_e1f2a3b4-c5d6-7890-1234-567890abcdef",
+        "status": "pending",
+        "total_files": 2,
+        "created_at": "2025-04-15T11:00:00.555555Z",
+        "callback_url": "https://your-webhook-listener.com/batch_callback"
+      }
+    }
+    ```
 
-### Invoice Parsing
+*   **Postman Setup:**
+    *   Method: `POST`
+    *   URL: `http://localhost:8000/api/v1/parse/statements/batch`
+    *   Auth: `Bearer Token`
+    *   Body: `raw`, `JSON`
+    *   Body Content: (Paste the Example Request Body JSON, using IDs from your upload responses)
 
-*   **`POST /parse/invoices`**: Submits an uploaded invoice for parsing.
-    *   Requires `Authorization` header.
-    *   Request Body: `ParseRequestModel` (JSON, similar to statements).
-    *   Enqueues a background job.
-    *   Returns `job_id`.
+#### 4.5 Get Bank Statement Batch Job Status
 
-*   **`GET /parse/invoices/{job_id}`**: Retrieves the status and results of a specific invoice parsing job.
-    *   Requires `Authorization` header.
-    *   Path Parameter: `job_id`.
-    *   Fetches job data from Redis.
-    *   Returns `JobResponseModel`.
+*   **Endpoint:** `GET /parse/statements/batch/{batch_id}`
+*   **Full URL Example:** `http://localhost:8000/api/v1/parse/statements/batch/batch_e1f2a3b4-c5d6-7890-1234-567890abcdef`
+*   **Description:** Retrieves the status of a batch job and its individual file processing statuses.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Path Parameter:** `batch_id` (from the batch submit response)
 
-*   **`GET /parse/invoices`**: Lists invoice parsing jobs for the user.
-    *   Requires `Authorization` header.
-    *   Query Parameters: `page`, `page_size`, `status`.
-    *   Fetches job data from Redis.
-    *   Returns `PaginatedJobResponse`.
+*   **Example Success Response (200 OK):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "batch_id": "batch_e1f2a3b4-c5d6-7890-1234-567890abcdef",
+        "status": "completed", // or processing, failed
+        "total_files": 2,
+        "processed_files": 2, // Files completed successfully
+        "failed_files": 0,
+        "created_at": "2025-04-15T11:00:00.555555Z",
+        "updated_at": "2025-04-15T11:05:00.666666Z",
+        "files": [
+          {
+            "file_id": "1713177605987654321_statement.png",
+            "document_id": "c2d3e4f5-g6h7-8901-2345-678901bcdefg",
+            "status": "completed",
+            "error": null
+          },
+          {
+            "file_id": "1713177700112233445_other_statement.pdf",
+            "document_id": "d3e4f5g6-h7i8-9012-3456-789012cdefgh",
+            "status": "completed",
+            "error": null
+          }
+        ],
+        "callback_url": "https://your-webhook-listener.com/batch_callback"
+      }
+    }
+    ```
 
-*   **`POST /parse/invoices/batch`**: Submits a batch of uploaded invoices for parsing.
-    *   Requires `Authorization` header.
-    *   Request Body: `BatchRequestModel` (JSON, similar to statements).
-    *   Enqueues multiple individual jobs.
-    *   Creates batch metadata in Redis.
-    *   Returns `batch_id`.
+*   **Postman Setup:**
+    *   Method: `GET`
+    *   URL: `http://localhost:8000/api/v1/parse/statements/batch/<YOUR_BATCH_ID>` (Replace `<YOUR_BATCH_ID>`)
+    *   Auth: `Bearer Token`
+    *   Body: `none`
 
-*   **`GET /parse/invoices/batch/{batch_id}`**: Retrieves the status of an invoice batch job.
-    *   Requires `Authorization` header.
-    *   Path Parameter: `batch_id`.
-    *   Fetches batch and job data from Redis.
-    *   Returns `BatchStatusResponseModel`.
+---
 
+### 5. Invoice Parsing
 
+Endpoints specific to submitting and managing invoice parsing jobs. These follow the same patterns as the Bank Statement endpoints.
+
+#### 5.1 Submit Invoice Job
+
+*   **Endpoint:** `POST /parse/invoices`
+*   **Full URL:** `http://localhost:8000/api/v1/parse/invoices`
+*   **Description:** Submits a previously uploaded invoice for asynchronous parsing.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Example Request Body (JSON):**
+    ```json
+    {
+      "file_id": "1713177600123456789_invoice.pdf", // file_id from upload response
+      "document_id": "b1c2d3e4-f5g6-7890-1234-567890abcdef", // doc_id from upload response
+      "schema_id": "a1b2c3d4-e5f6-7890-1234-567890abcdef", // Optional custom invoice schema
+      "callback_url": null
+    }
+    ```
+*   **Example Success Response (202 Accepted):** (Similar to statements, returns `job_id`)
+*   **Postman Setup:** (Similar to submitting a statement job)
+
+#### 5.2 Get Invoice Job Status
+
+*   **Endpoint:** `GET /parse/invoices/{job_id}`
+*   **Full URL Example:** `http://localhost:8000/api/v1/parse/invoices/job_f1e2d3c4-b5a6-7890-1234-567890abcdef`
+*   **Description:** Retrieves the status and results of a specific invoice job.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Example Success Response (200 OK):** (Similar structure to getting statement job status, `result` contains parsed invoice data)
+*   **Postman Setup:** (Similar to getting statement job status)
+
+#### 5.3 List Invoice Jobs
+
+*   **Endpoint:** `GET /parse/invoices`
+*   **Full URL:** `http://localhost:8000/api/v1/parse/invoices`
+*   **Description:** Lists invoice jobs for the user.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Query Parameters:** `page`, `page_size`, `status`
+*   **Example Success Response (200 OK):** (Similar structure to listing statement jobs)
+*   **Postman Setup:** (Similar to listing statement jobs)
+
+#### 5.4 Submit Invoice Batch Job
+
+*   **Endpoint:** `POST /parse/invoices/batch`
+*   **Full URL:** `http://localhost:8000/api/v1/parse/invoices/batch`
+*   **Description:** Submits multiple invoices for batch processing.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Example Request Body (JSON):** (Similar to statement batch, list invoice file/doc IDs)
+*   **Example Success Response (202 Accepted):** (Returns `batch_id`)
+*   **Postman Setup:** (Similar to submitting statement batch job)
+
+#### 5.5 Get Invoice Batch Job Status
+
+*   **Endpoint:** `GET /parse/invoices/batch/{batch_id}`
+*   **Full URL Example:** `http://localhost:8000/api/v1/parse/invoices/batch/batch_g1h2i3j4-k5l6-7890-1234-567890abcdef`
+*   **Description:** Retrieves the status of an invoice batch job.
+*   **Authentication:** Required (`Bearer Token`)
+*   **Example Success Response (200 OK):** (Similar structure to getting statement batch status)
+*   **Postman Setup:** (Similar to getting statement batch status)
+
+---
 
 ## Important Notes
 
